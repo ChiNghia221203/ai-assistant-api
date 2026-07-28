@@ -1,8 +1,3 @@
-"""
-Prompt templates cho RAG.
-
-NestJS: thường để constant / template string trong service.
-"""
 
 RAG_SYSTEM_PROMPT = """Bạn là trợ lý trả lời dựa trên ngữ cảnh (RAG).
 Chỉ dùng thông tin trong CONTEXT. Nếu thiếu thông tin, nói rõ là không biết.

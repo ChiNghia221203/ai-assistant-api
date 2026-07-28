@@ -1,6 +1,3 @@
-"""
-RAG HTTP routes — ≈ NestJS RagController.
-"""
 
 from fastapi import APIRouter, Depends
 

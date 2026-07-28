@@ -1,12 +1,5 @@
-"""
-Gộp tất cả router của API v1.
-
-NestJS tương đương: AppModule imports + RouterModule,
-hoặc controllers: [HealthController, ChatController, RagController]
-"""
 
 from fastapi import APIRouter
-
 from app.api.v1 import health
 from app.domains.chat.router import router as chat_router
 from app.domains.rag.router import router as rag_router
