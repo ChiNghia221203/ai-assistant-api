@@ -1,6 +1,5 @@
 
 from pydantic import BaseModel, Field
-from typing import List
 
 class ChatRequest(BaseModel):
     message: str = Field(

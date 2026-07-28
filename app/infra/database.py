@@ -5,7 +5,7 @@ NestJS tương đương: PrismaService / MongooseModule.
 Mẫu này chưa kết nối DB thật — chỉ giữ chỗ để bạn mở rộng sau.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 
@@ -34,8 +34,7 @@ def get_database(url: str) -> Database:
 
 
 @asynccontextmanager
-async def db_session(url: str) -> AsyncIterator[Database]:
-    """≈ NestJS request-scoped Prisma / UnitOfWork."""
+async def db_session(url: str) -> AsyncGenerator[Database, None]:
     db = get_database(url)
     if not db.connected:
         await db.connect()

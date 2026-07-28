@@ -7,6 +7,7 @@ NestJS tương đương: Injectable service gọi HTTP bên ngoài (axios/SDK).
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 
@@ -36,11 +37,11 @@ class LlmClient:
         )
 
     async def _openai_complete(self, system: str, user: str) -> str:
-        headers = {
+        headers: dict[str, str] = {
             "Authorization": f"Bearer {self.settings.openai_api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.settings.openai_model,
             "messages": [
                 {"role": "system", "content": system},
@@ -53,7 +54,7 @@ class LlmClient:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()
-            data = response.json()
+            data: dict[str, Any] = response.json()
 
         return data["choices"][0]["message"]["content"]
 

@@ -1,10 +1,12 @@
+from typing import Any
 
 from pydantic import BaseModel, Field
+
 
 class IngestDocument(BaseModel):
     id: str = Field(..., min_length=1, description="ID duy nhất của chunk")
     content: str = Field(..., min_length=1, description="Nội dung văn bản")
-    metadata: dict = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class IngestRequest(BaseModel):
