@@ -1,139 +1,54 @@
-# AI Assistant
+# Hotel multi-source review (Sài Gòn)
 
-> Một trợ lý AI thông minh được xây dựng bằng **Python** và **FastAPI**, hỗ trợ [mô tả ngắn gọn mục đích chính — ví dụ: trả lời câu hỏi, xử lý tài liệu, trò chuyện thông minh...].
+FastAPI backend: evidence from Chudu24 + TripAdvisor (optional Google later) stored in Supabase/pgvector → chat with quotes (no verdict).
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Status](https://img.shields.io/badge/status-active-success.svg)
+Corpus already lives in Supabase. Crawl/refresh scripts stay **local-only** (gitignored) — see [`scripts/README.md`](scripts/README.md).
 
----
+## Setup
 
-## Giới thiệu
-
-`AI-Assistant` là một backend service cung cấp API cho các tính năng trợ lý AI, được xây dựng trên nền tảng **FastAPI** với hiệu năng cao và dễ mở rộng.
-
-**Điểm nổi bật:**
-
-- Hiệu năng cao nhờ FastAPI (async/await)
-- Tích hợp LLM (OpenAI / Gemini / Local model...)
-- Hỗ trợ RAG (Retrieval-Augmented Generation) [nếu có]
-- Xác thực & phân quyền người dùng
-- Tự động sinh tài liệu API (Swagger/OpenAPI)
-
----
-
-## Cấu trúc dự án
-
-```
-ai-assistant/
-├── app/
-│   ├── api/                # Định nghĩa routes/endpoints
-│   │   └── v1/
-│   ├── core/                # Config, settings, security
-│   ├── models/               # Pydantic schemas / ORM models
-│   ├── services/             # Business logic, xử lý AI
-│   ├── db/                   # Kết nối database
-│   └── main.py                # Entry point FastAPI app
-├── tests/                     # Unit tests
-├── .env.example                # Mẫu biến môi trường
-├── requirements.txt             # Thư viện Python
-├── Dockerfile
-├── docker-compose.yml
-└── README.md
-```
-
----
-
-## Yêu cầu hệ thống
-
-- Python >= 3.11
-- pip / poetry
-- (Tùy chọn) Docker & Docker Compose
-- (Tùy chọn) PostgreSQL / MongoDB / Vector DB (pgvector, Qdrant...)
-
----
-
-## Cài đặt
-
-### 1. Clone dự án
+1. Create a Supabase project, enable the `vector` extension, run:
 
 ```bash
-git clone https://github.com/<username>/ai-assistant.git
-cd ai-assistant
+# In Supabase SQL Editor, paste:
+# supabase/migrations/001_hotel_review.sql
 ```
 
-### 2. Tạo môi trường ảo
-
-```bash
-python -m venv venv
-source venv/bin/activate   # Linux/macOS
-venv\Scripts\activate      # Windows
-```
-
-### 3. Cài đặt thư viện
-
-```bash
-pip install -r requirements.txt
-```
-
-### 4. Cấu hình biến môi trường
-
-Sao chép file mẫu và điền thông tin:
+2. Copy env:
 
 ```bash
 cp .env.example .env
+# fill SUPABASE_URL, SUPABASE_SERVICE_KEY (or SUPABASE_SECRET_KEY), OPENAI_API_KEY
+# optional: GOOGLE_PLACES_API_KEY
 ```
 
-```env
-APP_ENV=development
-OPENAI_API_KEY=your_api_key_here
-DATABASE_URL=postgresql://user:password@localhost:5432/ai_assistant
-```
-
-### 5. Chạy ứng dụng
+3. Install & run:
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uv sync
+uv run uvicorn main:app --reload --port 8000
 ```
 
-Truy cập tài liệu API tại: `http://localhost:8000/docs`
-
----
-
-## Chạy bằng Docker
+For local crawl/refresh (scripts present on this machine only):
 
 ```bash
-docker-compose up --build
+uv run playwright install chromium
+uv run python scripts/ingest_tripadvisor.py --slug <slug>
+uv run python scripts/ingest_chudu24.py --slug <slug>
+uv run python scripts/refresh_stale.py --days 30
 ```
 
----
+## API
 
-## API Endpoints (ví dụ)
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/v1/places` | List hotels |
+| GET | `/api/v1/places/{id}/evidence` | Multi-source evidence card |
+| POST | `/api/v1/rag/search` | Quote retrieval |
+| POST | `/api/v1/chat/review` | Evidence + RAG + LLM (no verdict) |
+| GET/POST | `/api/v1/chat/conversations` | Persist chat (Supabase Auth `user_id`) |
 
-| Method | Endpoint             | Mô tả                      |
-| ------ | -------------------- | -------------------------- |
-| POST   | `/api/v1/chat`       | Gửi tin nhắn tới trợ lý AI |
-| GET    | `/api/v1/health`     | Kiểm tra trạng thái server |
-| POST   | `/api/v1/auth/login` | Đăng nhập người dùng       |
+## Methodology (shown to users)
 
-> Xem chi tiết đầy đủ tại `/docs` (Swagger UI) khi server đang chạy.
-
----
-
-## Chạy kiểm thử (Testing)
-
-```bash
-pytest -v
-```
-
----
-
-## Công nghệ sử dụng
-
-- **Backend:** Python, FastAPI, Pydantic
-- **AI/LLM:** [OpenAI API / LangChain / LangGraph...]
-- **Database:** [PostgreSQL / MongoDB / pgvector...]
-- **Khác:** Docker, Uvicorn, Poetry/Pip
-
----
+- **Chudu24:** up to 100 newest reviews by date + `date_min`/`date_max` + `sample_mean`
+- **TripAdvisor:** up to 100 newest reviews by date (Playwright crawl) + site overall
+- **Google (optional):** Places API rating + returned reviews (often ≤5) — not claimed as 100 newest

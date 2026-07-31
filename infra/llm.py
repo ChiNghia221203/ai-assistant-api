@@ -1,23 +1,16 @@
-"""
-LLM client — gọi OpenAI hoặc mock khi học.
 
-NestJS tương đương: Injectable service gọi HTTP bên ngoài (axios/SDK).
-"""
 
 from __future__ import annotations
-
 import logging
 from typing import Any
-
 import httpx
 
-from app.core.config import Settings, get_settings
+from core.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
 
 
 class LlmClient:
-    """Gói gọi chat completion — domain không cần biết chi tiết HTTP."""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()

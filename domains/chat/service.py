@@ -1,7 +1,7 @@
 
-from app.core.config import Settings, get_settings
-from app.domains.chat.schemas import ChatRequest, ChatResponse
-from app.infra.llm import LlmClient, get_llm_client
+from core.config import Settings, get_settings
+from domains.chat.schemas import ChatRequest, ChatResponse
+from infra.llm import LlmClient, get_llm_client
 
 DEFAULT_SYSTEM = (
     "Bạn là trợ lý AI ngắn gọn, trả lời bằng tiếng Việt. "

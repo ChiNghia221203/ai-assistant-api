@@ -1,7 +1,7 @@
 [project]
-name = "python-learnin"
+name = "ai-assistant"
 version = "0.1.0"
-description = "Add your description here"
+description = "Hotel multi-source review API (Sài Gòn) with Supabase pgvector"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -9,4 +9,15 @@ dependencies = [
     "uvicorn[standard]>=0.51.0",
     "httpx>=0.28.0",
     "pydantic-settings>=2.6.0",
+    "supabase>=2.10.0",
+    "openai>=1.60.0",
+    "beautifulsoup4>=4.12.0",
+    "tenacity>=9.0.0",
+    "python-dotenv>=1.0.0",
+    "playwright>=1.49.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
 ]

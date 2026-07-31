@@ -3,9 +3,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1.router import api_router
-from app.core.config import get_settings
-from app.core.logging import setup_logging
+from api.v1.router import api_router
+from core.config import get_settings
+from core.logging import setup_logging
 
 
 @asynccontextmanager
@@ -21,7 +21,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.app_name,
         version="0.1.0",
-        description="AI learning project dùng FastAPI theo kiến trúc domain-based.",
+        description="AI Assistant API",
         lifespan=lifespan,  
     )
 

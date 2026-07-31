@@ -8,3 +8,30 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Env
+.env
+
+# Local crawl toolkit (kept on disk, do not push)
+scripts/ingest_*.py
+scripts/_ingest_common.py
+scripts/run_batch_ingest.py
+scripts/discover_hotels_hcm.py
+scripts/seed_places.py
+scripts/refresh_stale.py
+scripts/qa_review_counts.py
+scripts/check_db.py
+data/catalog_*.json
+data/discovered_hotels_hcm.*
+data/places_hcm_seed.csv
+
+# TripAdvisor Playwright profile + debug artifacts
+data/.ta_chrome_profile/
+data/debug_*
+data/_crawl_*.txt
+data/_next_crawl_slugs.txt
+
+# Accidental Node deps (not part of this API)
+node_modules/
+package.json
+package-lock.json

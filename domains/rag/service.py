@@ -1,28 +1,24 @@
-"""
-RAG business logic: retrieve → augment prompt → generate.
-"""
+"""Legacy RAG service — hotel flow uses places + /rag/search + /chat/review."""
 
-from app.core.config import Settings, get_settings
-from app.domains.rag.prompts import RAG_SYSTEM_PROMPT, build_rag_user_prompt
-from app.domains.rag.schemas import (
+from __future__ import annotations
+
+from core.config import Settings, get_settings
+from domains.rag.prompts import RAG_SYSTEM_PROMPT, build_rag_user_prompt
+from domains.rag.schemas import (
     IngestRequest,
     IngestResponse,
     RagQueryRequest,
     RagQueryResponse,
     RetrievedChunk,
 )
-from app.infra.llm import LlmClient, get_llm_client
-from app.infra.vector_store import (
-    DocumentChunk,
-    InMemoryVectorStore,
-    get_vector_store,
-)
+from infra.llm import LlmClient, get_llm_client
+from infra.vector_store import PgVectorStore, get_vector_store
 
 
 class RagService:
     def __init__(
         self,
-        store: InMemoryVectorStore | None = None,
+        store: PgVectorStore | None = None,
         llm: LlmClient | None = None,
         settings: Settings | None = None,
     ) -> None:
@@ -31,21 +27,19 @@ class RagService:
         self.settings = settings or get_settings()
 
     def ingest(self, payload: IngestRequest) -> IngestResponse:
-        chunks = [
-            DocumentChunk(id=d.id, content=d.content, metadata=d.metadata)
-            for d in payload.documents
-        ]
-        count = self.store.upsert(chunks)
-        return IngestResponse(ingested=count, total_in_store=self.store.count)
+        # Hotel corpus is ingested via local crawl scripts into Supabase.
+        return IngestResponse(ingested=0, total_in_store=0)
 
     async def query(self, payload: RagQueryRequest) -> RagQueryResponse:
-        hits = self.store.similarity_search(payload.question, top_k=payload.top_k)
-
+        hits = await self.store.similarity_search(
+            payload.question, top_k=payload.top_k
+        )
         if not hits:
             return RagQueryResponse(
                 answer=(
-                    "Chưa có tài liệu liên quan trong vector store. "
-                    "Hãy gọi POST /api/v1/rag/ingest trước."
+                    "Chưa có tài liệu trong pgvector. "
+                    "Corpus khách sạn nằm trên Supabase — kiểm tra seed/embed "
+                    "hoặc dùng POST /api/v1/chat/review."
                 ),
                 sources=[],
                 mock=self.settings.mock_llm or not self.settings.openai_api_key,
@@ -54,7 +48,6 @@ class RagService:
         context = "\n\n---\n\n".join(f"[{h.id}] {h.content}" for h in hits)
         user_prompt = build_rag_user_prompt(payload.question, context)
         answer = await self.llm.complete(RAG_SYSTEM_PROMPT, user_prompt)
-
         return RagQueryResponse(
             answer=answer,
             sources=[RetrievedChunk(id=h.id, content=h.content) for h in hits],
