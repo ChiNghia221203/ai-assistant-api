@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     chat_summary_batch: int = 20
 
     # Browser origins allowed to call the API (auth uses bearer tokens)
-    cors_allow_origins: str = "http://localhost:3000"
+    cors_allow_origins: str = ""
 
     # Chat costs money per turn, so cap per identity and per network
     rate_limit_enabled: bool = True
