@@ -1,29 +1,44 @@
+"""Lightweight chat entry point — runs the same cascade as /chat/review."""
+
+from __future__ import annotations
 
 from core.config import Settings, get_settings
+from core.security import AuthUser
 from domains.chat.schemas import ChatRequest, ChatResponse
-from infra.llm import LlmClient, get_llm_client
-
-DEFAULT_SYSTEM = (
-    "Bạn là trợ lý AI ngắn gọn, trả lời bằng tiếng Việt. "
-    "Giải thích khái niệm kỹ thuật rõ ràng cho người biết NestJS đang học Python."
-)
+from domains.places.review_chat import ReviewChatService, get_review_chat_service
+from domains.places.schemas import ReviewChatRequest
 
 
 class ChatService:
     def __init__(
         self,
-        llm: LlmClient | None = None,
+        review_chat: ReviewChatService | None = None,
         settings: Settings | None = None,
     ) -> None:
-        self.llm = llm or get_llm_client()
+        self.review_chat = review_chat or get_review_chat_service()
         self.settings = settings or get_settings()
 
-    async def chat(self, payload: ChatRequest) -> ChatResponse:
-        system = payload.system_prompt or DEFAULT_SYSTEM
-        reply = await self.llm.complete(system=system, user=payload.message)
+    async def chat(
+        self, payload: ChatRequest, user: AuthUser | None = None
+    ) -> ChatResponse:
+        result = await self.review_chat.chat(
+            ReviewChatRequest(
+                message=payload.message,
+                place_id=payload.place_id,
+                place_ids=payload.place_ids,
+                conversation_id=payload.conversation_id,
+                top_k=payload.top_k,
+            ),
+            user=user,
+        )
         return ChatResponse(
-            reply=reply,
-            mock=self.settings.mock_llm or not self.settings.openai_api_key,
+            reply=result.reply,
+            mock=result.mock,
+            conversation_id=result.conversation_id,
+            retrieval_source=result.retrieval_source,
+            web_citations=result.web_citations,
+            search_suggestion_html=result.search_suggestion_html,
+            reference_only=result.reference_only,
         )
 
 

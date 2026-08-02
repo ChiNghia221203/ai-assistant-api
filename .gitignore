@@ -21,6 +21,7 @@ scripts/seed_places.py
 scripts/refresh_stale.py
 scripts/qa_review_counts.py
 scripts/check_db.py
+scripts/reembed_documents.py
 data/catalog_*.json
 data/discovered_hotels_hcm.*
 data/places_hcm_seed.csv

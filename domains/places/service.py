@@ -22,16 +22,16 @@ logger = logging.getLogger(__name__)
 
 METHODOLOGY = {
     "chudu24": (
-        "100 review mới nhất theo ngày đăng (hoặc ít hơn nếu thiếu); "
-        "sample_mean tính từ mẫu đó."
+        "Chudu24: tối đa 100 review mới nhất theo ngày đăng "
+        "(hoặc ít hơn nếu nguồn chưa đủ)."
     ),
     "google": (
-        "rating + reviews trả về từ Places API (thường ≤5); "
+        "Google Places: rating + một số review API trả về (thường ≤5); "
         "không phải 100 review mới nhất."
     ),
     "tripadvisor": (
-        "100 review mới nhất theo ngày đăng (hoặc ít hơn nếu thiếu); "
-        "sample_mean tính từ mẫu đó; điểm tổng site vẫn hiện."
+        "TripAdvisor: tối đa 100 review mới nhất theo ngày đăng "
+        "(hoặc ít hơn nếu nguồn chưa đủ); Score trang vẫn hiện."
     ),
 }
 
@@ -93,7 +93,8 @@ class PlacesService:
         )
         sources = [self._source_evidence(s) for s in snaps]
         # Stable order
-        order = {"chudu24": 0, "google": 1, "tripadvisor": 2}
+        # TripAdvisor first in evidence payload so the model leads with it.
+        order = {"tripadvisor": 0, "chudu24": 1, "google": 2}
         sources.sort(key=lambda s: order.get(s.source, 99))
 
         return PlaceEvidenceResponse(
@@ -119,14 +120,29 @@ class PlacesService:
             chunks = await self.store.similarity_search(query, top_k=top_k)
             return [self._quote_from_chunk(c.__dict__) for c in chunks]
 
-        # Search per place then merge by similarity
+        # Over-fetch + EN pass: VI queries otherwise drown TripAdvisor (EN)
+        # under Chudu24 (VI) similarity hits.
         merged: list[QuoteOut] = []
-        per = max(2, top_k // max(len(ids), 1))
-        for pid in ids:
-            chunks = await self.store.similarity_search(
-                query, top_k=per, place_id=pid
+        seen_ids: set[str] = set()
+        per = max(10, top_k * 2)
+        queries = [query]
+        if any(ord(ch) > 127 for ch in query):
+            queries.append(
+                "TripAdvisor hotel guest review staff service "
+                "cleanliness location room breakfast"
             )
-            merged.extend(self._quote_from_chunk(c.__dict__) for c in chunks)
+
+        for pid in ids:
+            for q in queries:
+                chunks = await self.store.similarity_search(
+                    q, top_k=per, place_id=pid
+                )
+                for chunk in chunks:
+                    key = chunk.id or f"{chunk.source}:{chunk.content[:40]}"
+                    if key in seen_ids:
+                        continue
+                    seen_ids.add(key)
+                    merged.append(self._quote_from_chunk(chunk.__dict__))
 
         merged.sort(key=lambda q: q.similarity or 0.0, reverse=True)
         return _diversify_quotes(merged, top_k)
@@ -207,21 +223,78 @@ class PlacesService:
         )
 
 
+_SOURCE_RANK = {"tripadvisor": 0, "chudu24": 1, "google": 2}
+# Clear balance when both corpora exist (then fill remaining slots).
+_PRIMARY_SOURCES = ("tripadvisor", "chudu24")
+_PRIMARY_QUOTA = 2
+
+
+def _mix_scores_within_source(items: list[QuoteOut]) -> list[QuoteOut]:
+    """Interleave high / low scores so highlights are not all 5★."""
+    high = [q for q in items if (q.score or 3) >= 4]
+    low = [q for q in items if (q.score or 3) < 3.5]
+    mid = [q for q in items if q not in high and q not in low]
+    mixed: list[QuoteOut] = []
+    while high or low or mid:
+        if high:
+            mixed.append(high.pop(0))
+        if low:
+            mixed.append(low.pop(0))
+        if mid:
+            mixed.append(mid.pop(0))
+    return mixed
+
+
 def _diversify_quotes(quotes: list[QuoteOut], top_k: int) -> list[QuoteOut]:
-    """Prefer mix of higher and lower scores when available."""
-    if len(quotes) <= top_k:
-        return quotes
-    high = [q for q in quotes if (q.score or 3) >= 4]
-    low = [q for q in quotes if (q.score or 3) < 3.5]
-    mid = [q for q in quotes if q not in high and q not in low]
+    """Balance quotes: up to 2 TripAdvisor + 2 Chudu24, then fill.
+
+    VI queries otherwise drown TA under Chudu24 by similarity. Always
+    reorders even when ``len(quotes) <= top_k``. Missing source → fill
+    from the other.
+    """
+    if not quotes or top_k <= 0:
+        return []
+
+    by_source: dict[str, list[QuoteOut]] = {}
+    for q in quotes:
+        by_source.setdefault(q.source or "unknown", []).append(q)
+
+    for source, items in by_source.items():
+        by_source[source] = _mix_scores_within_source(items)
+
+    cursors = {s: 0 for s in by_source}
     out: list[QuoteOut] = []
-    while len(out) < top_k and (high or low or mid):
-        if high and len(out) < top_k:
-            out.append(high.pop(0))
-        if low and len(out) < top_k:
-            out.append(low.pop(0))
-        if mid and len(out) < top_k:
-            out.append(mid.pop(0))
+
+    # Pass 1: interleave up to 2 from each primary source.
+    for _ in range(_PRIMARY_QUOTA):
+        for source in _PRIMARY_SOURCES:
+            if len(out) >= top_k:
+                break
+            bucket = by_source.get(source) or []
+            i = cursors.get(source, 0)
+            if i < len(bucket):
+                out.append(bucket[i])
+                cursors[source] = i + 1
+
+    # Pass 2: round-robin remaining slots (TA → Chudu24 → Google → …).
+    source_order = sorted(
+        by_source.keys(),
+        key=lambda s: _SOURCE_RANK.get(s, 9),
+    )
+    while len(out) < top_k:
+        progressed = False
+        for source in source_order:
+            i = cursors.get(source, 0)
+            bucket = by_source[source]
+            if i < len(bucket):
+                out.append(bucket[i])
+                cursors[source] = i + 1
+                progressed = True
+                if len(out) >= top_k:
+                    break
+        if not progressed:
+            break
+
     return out[:top_k]
 
 

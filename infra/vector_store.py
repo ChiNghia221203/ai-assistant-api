@@ -1,4 +1,3 @@
-"""OpenAI embeddings + Supabase pgvector retrieval."""
 
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -73,12 +73,22 @@ class RagSearchResponse(BaseModel):
 
 
 class ReviewChatRequest(BaseModel):
+    """The owner is never taken from the body — it comes from the bearer token."""
+
     message: str = Field(..., min_length=1, max_length=4000)
     place_id: UUID | None = None
     place_ids: list[UUID] = Field(default_factory=list)
     conversation_id: UUID | None = None
-    user_id: UUID | None = None
     top_k: int = Field(default=8, ge=1, le=20)
+
+
+class WebCitationOut(BaseModel):
+    title: str = ""
+    url: str
+    source: str = "gemini"
+
+
+RetrievalSource = Literal["rag", "rag+gemini", "rag+web_search", "abstain"]
 
 
 class ReviewChatResponse(BaseModel):
@@ -87,12 +97,27 @@ class ReviewChatResponse(BaseModel):
     quotes: list[QuoteOut]
     conversation_id: UUID | None = None
     mock: bool = False
+    retrieval_source: RetrievalSource = "rag"
+    web_citations: list[WebCitationOut] = Field(default_factory=list)
+    # Google Search Suggestions HTML — must be rendered when grounding was used
+    search_suggestion_html: str = ""
+    # True for price / promotion / live-status answers: informational only
+    reference_only: bool = False
 
 
 class ConversationCreate(BaseModel):
     title: str = "New conversation"
     place_ids: list[UUID] = Field(default_factory=list)
-    user_id: UUID
+
+
+class ClaimGuestRequest(BaseModel):
+    """Access token of the anonymous session whose history should be moved."""
+
+    guest_token: str = Field(..., min_length=1)
+
+
+class ClaimGuestResponse(BaseModel):
+    claimed: int
 
 
 class ConversationOut(BaseModel):
