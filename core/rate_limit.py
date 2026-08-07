@@ -1,13 +1,3 @@
-"""Rate limiting for the chat endpoints.
-
-Every chat turn costs money (embeddings + grounding + completion) and anonymous
-sign-ups are unlimited, so requests are capped per identity *and* per network:
-rotating anonymous users from one machine still hits the network bucket.
-
-State is in-process, so limits are per worker and reset on restart. That is
-enough for a single instance; swap `_limiter` for a Redis-backed store before
-running several replicas.
-"""
 
 from __future__ import annotations
 

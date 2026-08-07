@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_embedding_model: str = "text-embedding-3-small"
+    # Cheap/fast model for structured intent extract (function calling).
+    # gpt-4.1-nano ≈ $0.10/M in; gpt-5-nano ≈ $0.05/M in (cheapest).
+    # Keep answer model (openai_model) separate — extract only needs classification.
+    openai_extract_model: str = "gpt-4.1-nano"
 
     supabase_url: str = ""
     supabase_service_key: str = ""
@@ -40,11 +44,18 @@ class Settings(BaseSettings):
 
     # Fallback live search (OpenAI Responses `web_search` tool)
     openai_search_model: str = "gpt-5.5"
-    web_search_allowed_domains: str = "tripadvisor.com,tripadvisor.com.vn"
+    # Trusted sources for static-fact / out-of-catalog hotel grounding.
+    # Price / promotion / live-status questions ignore this and search the open web
+    # (answer is flagged reference_only).
+    web_search_allowed_domains: str = (
+        "tripadvisor.com,tripadvisor.com.vn,traveloka.com,www.traveloka.com"
+    )
 
     # RAG sufficiency gate (review chat cascade)
     rag_min_quotes: int = 2
     rag_min_similarity: float = 0.35
+    # Quotes fetched per source (tripadvisor / chudu24) before merge + top_k cap
+    rag_per_source_k: int = 2
 
     # How many previous turns are replayed to the model verbatim
     chat_history_limit: int = 8

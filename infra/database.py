@@ -1,4 +1,3 @@
-"""Supabase client (service role) for ingest + API."""
 
 from __future__ import annotations
 

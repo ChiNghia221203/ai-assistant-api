@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
+from typing import Any
 
 from core.config import Settings, get_settings
 from domains.places.place_match import is_area_recommend_intent
@@ -116,6 +117,24 @@ _HOTEL_ASK_RE = re.compile(
     re.IGNORECASE,
 )
 
+# "khách sạn <Name>" / "hotel <Name>" where Name is not a generic "nào/ở/tại..."
+_SPECIFIC_HOTEL_NAME_RE = re.compile(
+    r"(?:khách\s*sạn|khach\s*san|\bhotel\b)\s+"
+    r"(?!nào\b|nao\b|ở\b|o\b|tại\b|tai\b|gần\b|gan\b|trong\b|này\b|nay\b|đó\b|do\b)"
+    r"([A-Za-zÀ-ỹ0-9][\wÀ-ỹ\.\-]*(?:\s+[A-Za-zÀ-ỹ0-9][\wÀ-ỹ\.\-]*){0,5})",
+    re.IGNORECASE,
+)
+
+# "review về Ramada…", "đánh giá về X" without requiring the "khách sạn" prefix.
+_REVIEW_ABOUT_NAME_RE = re.compile(
+    r"(?:review|đánh\s*giá|danh\s*gia|thông\s*tin|thong\s*tin)\s+"
+    r"(?:về|ve|cho|of|on)\s+"
+    r"(?:(?:khách\s*sạn|khach\s*san|\bks\b|\bhotel\b)\s+)?"
+    r"(?!nào\b|nao\b|ở\b|o\b|tại\b|tai\b|gần\b|gan\b|trong\b)"
+    r"([A-Za-zÀ-ỹ0-9][\wÀ-ỹ\.\-]*(?:\s+[A-Za-zÀ-ỹ0-9][\wÀ-ỹ\.\-]*){0,6})",
+    re.IGNORECASE,
+)
+
 # Always refuse — even if a hotel name is used as camouflage ("lách").
 # Keep patterns tight: "phạm vi tân bình" (area) must NEVER match tội phạm / vụ án.
 _HARD_OUT_OF_SCOPE_RE = re.compile(
@@ -165,19 +184,19 @@ ABSTAIN_NO_DATA = (
     "Vui lòng chọn khách sạn đã được ingest, hoặc hỏi lại khi dữ liệu được cập nhật."
 )
 
-ABSTAIN_OUT_OF_SCOPE = (
-    "Câu hỏi này **không thuộc phạm vi** hỗ trợ của trợ lý. "
-    "Mình chỉ hỗ trợ thông tin đánh giá / trải nghiệm khách sạn tại TP. Hồ Chí Minh "
-    "từ dữ liệu đã thu thập (Chudu24, TripAdvisor) và các nhu cầu liên quan cơ bản "
-    "(phòng, nhân viên, ăn sáng, vị trí, tiện ích, giá tham khảo, so sánh khách sạn). "
-    "Bạn hãy hỏi lại trong phạm vi đó nhé."
+ABSTAIN_HARD_OUT = (
+    "Mình chỉ hỗ trợ thông tin đánh giá khách sạn tại TP.HCM dựa trên dữ liệu đã "
+    "thu thập, nên không có thông tin về phần này. Bạn cần hỏi về khách sạn nào để "
+    "mình hỗ trợ?"
 )
 
-MIXED_SCOPE_NOTICE = (
-    "> **Phạm vi:** phần hỏi ngoài chủ đề khách sạn / review "
-    "(ví dụ mua sắm, tin tức không liên quan) **không thuộc phạm vi hỗ trợ** — "
-    "mình chỉ trả lời phần liên quan khách sạn bên dưới."
+MIXED_OFF_TOPIC_REFUSE = (
+    "Phần hỏi ngoài đánh giá khách sạn (mua sắm, laptop, điện thoại, …) "
+    "mình **không hỗ trợ**. Bạn chỉ cần hỏi thêm về trải nghiệm khách sạn trong dữ liệu đã thu thập."
 )
+
+# Backward-compatible alias for callers/tests still importing the old name.
+ABSTAIN_OUT_OF_SCOPE = ABSTAIN_HARD_OUT
 
 REFERENCE_NOTICE = (
     "> **Chỉ mang tính tham khảo:** thông tin về giá / khuyến mãi / tình trạng hoạt động "
@@ -194,9 +213,9 @@ class QuestionIntent(str, Enum):
 
 class ScopeKind(str, Enum):
     IN_SCOPE = "in_scope"
-    OUT_OF_SCOPE = "out_of_scope"
-    # Hotel ask + off-topic in one message — answer hotel part only.
     MIXED = "mixed"
+    HARD_OUT = "hard_out"
+    AMBIGUOUS_ENTITY = "ambiguous_entity"
 
 
 class RetrievalDecision(str, Enum):
@@ -207,7 +226,8 @@ class RetrievalDecision(str, Enum):
     NEED_GROUNDING_REFERENCE = "need_grounding_reference"
     ABSTAIN_BEYOND_SAMPLE = "abstain_beyond_sample"
     ABSTAIN_NO_DATA = "abstain_no_data"
-    ABSTAIN_OUT_OF_SCOPE = "abstain_out_of_scope"
+    ABSTAIN_OUT_OF_SCOPE = "abstain_out_of_scope"  # hard refuse (legacy name)
+    ABSTAIN_AMBIGUOUS_ENTITY = "abstain_ambiguous_entity"
 
 
 @dataclass(frozen=True)
@@ -231,8 +251,8 @@ def has_soft_out_of_scope(message: str) -> bool:
 
 
 def is_out_of_scope_intent(message: str) -> bool:
-    """True when the whole message should be refused (no hotel answer)."""
-    return classify_scope(message) == ScopeKind.OUT_OF_SCOPE
+    """True when the whole message should be hard-refused (no hotel answer)."""
+    return classify_scope(message) == ScopeKind.HARD_OUT
 
 
 def has_in_scope_hotel_ask(message: str) -> bool:
@@ -251,12 +271,37 @@ def has_in_scope_hotel_ask(message: str) -> bool:
     return False
 
 
-def classify_scope(message: str) -> ScopeKind:
-    """Resolve in-scope / out-of-scope / mixed (hotel + off-topic).
+def _strip_location_qualifier(span: str) -> str:
+    return re.sub(
+        r"\s+(quận|quan|q\.?|district)\s*\d*\s*$",
+        "",
+        span,
+        flags=re.IGNORECASE,
+    ).strip()
 
-    Hard topics (crime, politics, …) always refuse — even with a hotel name.
-    Soft topics (shopping, sports, …) refuse alone; if mixed with a real hotel
-    ask, allow RAG for the hotel part only.
+
+def looks_like_specific_hotel_ask(message: str) -> bool:
+    """User names a specific hotel (not 'khách sạn nào / ở quận…')."""
+    text = message or ""
+    return bool(
+        _SPECIFIC_HOTEL_NAME_RE.search(text) or _REVIEW_ABOUT_NAME_RE.search(text)
+    )
+
+
+def extract_specific_hotel_span(message: str) -> str | None:
+    """Best-effort hotel name span after 'khách sạn' / 'hotel' / 'review về'."""
+    text = message or ""
+    match = _SPECIFIC_HOTEL_NAME_RE.search(text) or _REVIEW_ABOUT_NAME_RE.search(text)
+    if not match:
+        return None
+    span = _strip_location_qualifier((match.group(1) or "").strip())
+    return span or None
+
+
+def classify_scope(message: str) -> ScopeKind:
+    """Message-level scope: hard_out / mixed / in_scope.
+
+    Ambiguous entity is resolved later in chat() after place/area matching.
     """
     text = message or ""
     hard = has_hard_out_of_scope(text)
@@ -264,12 +309,104 @@ def classify_scope(message: str) -> ScopeKind:
     hotel = has_in_scope_hotel_ask(text)
 
     if hard:
-        return ScopeKind.OUT_OF_SCOPE
+        return ScopeKind.HARD_OUT
     if soft and hotel:
         return ScopeKind.MIXED
     if soft:
-        return ScopeKind.OUT_OF_SCOPE
+        return ScopeKind.HARD_OUT
     return ScopeKind.IN_SCOPE
+
+
+def is_ambiguous_entity(
+    message: str,
+    *,
+    named_matched: bool,
+    area_places_found: bool,
+    used_conversation_place_ids: bool,
+) -> bool:
+    """True when user asked about an area/hotel we cannot resolve in the catalog.
+
+    Must run AFTER place/area matching. Follow-ups that reuse conversation
+    place_ids are not ambiguous.
+    """
+    if classify_scope(message) == ScopeKind.HARD_OUT:
+        return False
+    if classify_scope(message) == ScopeKind.MIXED:
+        return False
+    if named_matched:
+        return False
+    if used_conversation_place_ids:
+        return False
+
+    if is_area_recommend_intent(message) and not area_places_found:
+        return True
+    if looks_like_specific_hotel_ask(message):
+        return True
+    return False
+
+
+def ambiguous_entity_message(
+    available_places: list[dict[str, Any]] | None = None,
+    *,
+    area_label: str | None = None,
+    hotel_label: str | None = None,
+) -> str:
+    if hotel_label:
+        lines = [
+            f"Hiện **chưa có dữ liệu đã thu thập** cho khách sạn **{hotel_label}** "
+            "trong hệ thống.",
+        ]
+    elif area_label:
+        lines = [
+            f"Hiện chưa có khách sạn đã thu thập gắn địa chỉ khu vực **{area_label}** "
+            "trong dữ liệu hệ thống.",
+        ]
+    else:
+        lines = [
+            "Hiện chưa có dữ liệu đã thu thập cho khách sạn/khu vực bạn hỏi.",
+        ]
+    names = [
+        str(p.get("name") or "").strip()
+        for p in (available_places or [])
+        if p.get("name")
+    ]
+    if names:
+        preview = ", ".join(names[:12])
+        more = f" (và {len(names) - 12} KS khác)" if len(names) > 12 else ""
+        lines.append(f"Các khách sạn đang có trong hệ thống: {preview}{more}.")
+        lines.append(
+            "Bạn chọn giúp mình một tên trong danh sách, hoặc hỏi theo tiêu chí "
+            "(ồn, ăn sáng, vị trí…)."
+        )
+    else:
+        lines.append(
+            "Bạn thử hỏi lại bằng tên khách sạn đã được ingest, hoặc tiêu chí trải nghiệm cụ thể."
+        )
+    return " ".join(lines)
+
+
+def ambiguous_name_message(
+    candidates: list[dict[str, Any]],
+    *,
+    hotel_label: str | None = None,
+) -> str:
+    """Ask user to pick a branch when one brand matches multiple catalog places."""
+    label = (hotel_label or "khách sạn này").strip()
+    lines = [
+        f"Mình tìm thấy **nhiều chi nhánh/khách sạn** trùng với **{label}**. "
+        "Bạn chọn giúp một địa điểm cụ thể:",
+    ]
+    for i, p in enumerate(candidates[:8], start=1):
+        name = str(p.get("name") or "").strip()
+        addr = str(p.get("address") or "").strip()
+        if not name:
+            continue
+        if addr:
+            lines.append(f"{i}. **{name}** — {addr}")
+        else:
+            lines.append(f"{i}. **{name}**")
+    lines.append("Bạn trả lời bằng tên đầy đủ hoặc kèm quận/khu vực nhé.")
+    return "\n".join(lines)
 
 
 def classify_intent(message: str) -> QuestionIntent:
@@ -293,7 +430,7 @@ def decide_retrieval(
     cfg = settings or get_settings()
     scope = classify_scope(message)
 
-    if scope == ScopeKind.OUT_OF_SCOPE:
+    if scope == ScopeKind.HARD_OUT:
         return GateResult(
             RetrievalDecision.ABSTAIN_OUT_OF_SCOPE,
             QuestionIntent.EXPERIENCE,
@@ -335,16 +472,6 @@ def decide_retrieval(
             scope=scope,
         )
 
-    # Area recommend with no district match: still ask LLM using the place catalog
-    # (honest "chưa có KS tại quận X trong dữ liệu") — do not abstain as out-of-scope.
-    if is_area_recommend_intent(message) and not has_evidence and not quotes:
-        return GateResult(
-            RetrievalDecision.RAG_ONLY,
-            intent,
-            reason="area_recommend_catalog_only",
-            scope=scope,
-        )
-
     # Subjective questions: web search cannot replace the review corpus.
     if intent == QuestionIntent.EXPERIENCE:
         if has_evidence or quotes:
@@ -373,5 +500,7 @@ def abstain_message(decision: RetrievalDecision) -> str:
     if decision == RetrievalDecision.ABSTAIN_BEYOND_SAMPLE:
         return ABSTAIN_BEYOND_SAMPLE
     if decision == RetrievalDecision.ABSTAIN_OUT_OF_SCOPE:
-        return ABSTAIN_OUT_OF_SCOPE
+        return ABSTAIN_HARD_OUT
+    if decision == RetrievalDecision.ABSTAIN_AMBIGUOUS_ENTITY:
+        return ambiguous_entity_message()
     return ABSTAIN_NO_DATA

@@ -14,11 +14,17 @@ from domains.places.schemas import (
     SampleBlock,
     SourceEvidence,
 )
+from core.config import Settings, get_settings
 from domains.places.stats import contrast_site_overall
 from infra.database import get_supabase
-from infra.vector_store import PgVectorStore, get_vector_store
+from infra.vector_store import DocumentChunk, PgVectorStore, get_vector_store
 
 logger = logging.getLogger(__name__)
+
+_TA_EN_BOOSTER = (
+    "TripAdvisor hotel guest review staff service "
+    "cleanliness location room breakfast"
+)
 
 METHODOLOGY = {
     "chudu24": (
@@ -37,8 +43,13 @@ METHODOLOGY = {
 
 
 class PlacesService:
-    def __init__(self, store: PgVectorStore | None = None) -> None:
+    def __init__(
+        self,
+        store: PgVectorStore | None = None,
+        settings: Settings | None = None,
+    ) -> None:
         self.store = store or get_vector_store()
+        self.settings = settings or get_settings()
 
     def list_places(self, city: str | None = "Ho Chi Minh") -> list[PlaceOut]:
         sb = get_supabase()
@@ -112,40 +123,90 @@ class PlacesService:
         place_ids: list[UUID] | None = None,
         top_k: int = 8,
     ) -> list[QuoteOut]:
+        """Retrieve up to rag_per_source_k quotes per primary source, then cap.
+
+        Per-source RPC filters avoid VI queries drowning TripAdvisor (EN).
+        Request ``top_k`` is a total cap after merge, not a substitute for
+        per-source quota.
+        """
         ids = list(place_ids or [])
         if place_id:
-            ids.append(UUID(str(place_id)) if not isinstance(place_id, UUID) else place_id)
-
-        if not ids:
-            chunks = await self.store.similarity_search(query, top_k=top_k)
-            return [self._quote_from_chunk(c.__dict__) for c in chunks]
-
-        # Over-fetch + EN pass: VI queries otherwise drown TripAdvisor (EN)
-        # under Chudu24 (VI) similarity hits.
-        merged: list[QuoteOut] = []
-        seen_ids: set[str] = set()
-        per = max(10, top_k * 2)
-        queries = [query]
-        if any(ord(ch) > 127 for ch in query):
-            queries.append(
-                "TripAdvisor hotel guest review staff service "
-                "cleanliness location room breakfast"
+            ids.append(
+                UUID(str(place_id)) if not isinstance(place_id, UUID) else place_id
             )
 
-        for pid in ids:
-            for q in queries:
-                chunks = await self.store.similarity_search(
-                    q, top_k=per, place_id=pid
-                )
-                for chunk in chunks:
+        per_k = max(1, int(self.settings.rag_per_source_k))
+        merged: list[QuoteOut] = []
+        seen_ids: set[str] = set()
+
+        if ids:
+            for pid in ids:
+                for source in _PRIMARY_SOURCES:
+                    for chunk in await self._search_source_chunks(
+                        query, per_k, place_id=pid, source=source
+                    ):
+                        key = chunk.id or f"{chunk.source}:{chunk.content[:40]}"
+                        if key in seen_ids:
+                            continue
+                        seen_ids.add(key)
+                        merged.append(self._quote_from_chunk(chunk.__dict__))
+        else:
+            for source in _PRIMARY_SOURCES:
+                for chunk in await self._search_source_chunks(
+                    query, per_k, place_id=None, source=source
+                ):
                     key = chunk.id or f"{chunk.source}:{chunk.content[:40]}"
                     if key in seen_ids:
                         continue
                     seen_ids.add(key)
                     merged.append(self._quote_from_chunk(chunk.__dict__))
 
-        merged.sort(key=lambda q: q.similarity or 0.0, reverse=True)
-        return _diversify_quotes(merged, top_k)
+        out = _diversify_quotes(merged, top_k)
+        by_source: dict[str, int] = {}
+        for q in out:
+            src = q.source or "unknown"
+            by_source[src] = by_source.get(src, 0) + 1
+        logger.info(
+            "quotes_by_source=%s place_ids=%s top_k=%s per_source_k=%s pool=%d",
+            by_source,
+            [str(i) for i in ids] if ids else None,
+            top_k,
+            per_k,
+            len(merged),
+        )
+        return out
+
+    async def _search_source_chunks(
+        self,
+        query: str,
+        per_k: int,
+        *,
+        place_id: UUID | None,
+        source: str,
+    ) -> list[DocumentChunk]:
+        """Fetch up to per_k chunks for one source; EN booster for TripAdvisor."""
+        queries = [query]
+        if source == "tripadvisor" and any(ord(ch) > 127 for ch in (query or "")):
+            queries.append(_TA_EN_BOOSTER)
+
+        bucket: list[DocumentChunk] = []
+        seen: set[str] = set()
+        for q in queries:
+            chunks = await self.store.similarity_search(
+                q,
+                top_k=per_k,
+                place_id=place_id,
+                source=source,
+            )
+            for chunk in chunks:
+                key = chunk.id or f"{chunk.source}:{chunk.content[:40]}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                bucket.append(chunk)
+
+        bucket.sort(key=lambda c: c.similarity or 0.0, reverse=True)
+        return bucket[:per_k]
 
     def _place_out(self, row: dict[str, Any]) -> PlaceOut:
         return PlaceOut(

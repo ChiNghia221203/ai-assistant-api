@@ -1,10 +1,16 @@
-"""Match hotel names / districts mentioned in a user message to known places."""
+"""Low-level string matchers for hotel names and districts.
+
+Prefer EntityResolver (entity_resolve.py) for chat routing. This module stays
+pure and side-effect free so tests / index builders can reuse it.
+"""
 
 from __future__ import annotations
 
 import re
 import unicodedata
 from typing import TYPE_CHECKING
+
+from domains.places.geo_lexicon import DISTRICTS, district_aliases
 
 if TYPE_CHECKING:
     from domains.places.schemas import PlaceOut
@@ -39,27 +45,28 @@ _STOP = frozenset(
     }
 )
 
-# Folded aliases → match against folded place.address / name / city.
-_DISTRICT_ALIASES: dict[str, tuple[str, ...]] = {
-    "tan binh": ("tan binh", "quan tan binh", "district tan binh"),
-    "binh thanh": ("binh thanh", "quan binh thanh", "district binh thanh"),
-    "phu nhuan": ("phu nhuan", "quan phu nhuan", "district phu nhuan"),
-    "quan 1": ("quan 1", "district 1", " q1 ", "q.1"),
-    "quan 3": ("quan 3", "district 3", " q3 ", "q.3"),
-    "quan 5": ("quan 5", "district 5", " q5 ", "q.5"),
-    "quan 7": ("quan 7", "district 7", " q7 ", "q.7"),
-    "go vap": ("go vap", "quan go vap", "district go vap"),
-    "thu duc": ("thu duc", "tp thu duc", "thu duc city"),
-}
+# Hotel noun including common abbreviations (KS / ks).
+_HOTEL_NOUN = r"(?:khách\s*sạn|khach\s*san|\bks\b|\bhotel\b|\bresort\b)"
 
 _AREA_RECOMMEND_RE = re.compile(
     r"("
-    r"chọn\s*khách\s*sạn\s*nào|khách\s*sạn\s*nào|nen\s*chon\s*khach\s*san"
-    r"|gợi\s*ý\s*khách\s*sạn|goi\s*y\s*khach\s*san|recommend\s*(a\s*)?hotel"
-    r"|khách\s*sạn\s*(ở|tai|tại|gần|trong)"
-    r"|trong\s*(khu\s*vực|phạm\s*vi|quan|quận)"
-    r"|phạm\s*vi\s*(tân|tan|quận|quan|q\d)"
+    rf"chọn\s*{_HOTEL_NOUN}\s*nào"
+    rf"|nen\s*chon\s*{_HOTEL_NOUN}\s*nao"
+    rf"|{_HOTEL_NOUN}\s*nào"
+    rf"|{_HOTEL_NOUN}\s*nao"
+    rf"|gợi\s*ý\s*{_HOTEL_NOUN}|goi\s*y\s*{_HOTEL_NOUN}|recommend\s*(a\s*)?hotel"
+    rf"|{_HOTEL_NOUN}\s*(ở|o|tai|tại|gần|gan|trong)"
+    rf"|nên\s*chọn\s*{_HOTEL_NOUN}|nen\s*chon\s*{_HOTEL_NOUN}"
+    r"|trong\s*(khu\s*vực|khu\s*vuc|phạm\s*vi|pham\s*vi|quan|quận)"
+    r"|phạm\s*vi\s*|pham\s*vi\s*"
+    r"|ở\s*(quận|quan|phường|phuong)|o\s*(quan|quận)"
+    r"|tại\s*(quận|quan)|tai\s*(quan|quận)"
     r")",
+    re.IGNORECASE,
+)
+
+_HOTEL_CUE_RE = re.compile(
+    rf"({_HOTEL_NOUN}|chọn|chon|gợi\s*ý|goi\s*y|nên|nen|nào|nao)",
     re.IGNORECASE,
 )
 
@@ -78,19 +85,68 @@ def place_core_name(name: str) -> str:
     return re.sub(r"^\d+\s+", "", core).strip()
 
 
+def alias_hits_text(folded: str, aliases: tuple[str, ...]) -> bool:
+    """True if any alias appears in folded text (phrase or compact form)."""
+    if not folded:
+        return False
+    padded = f" {folded} "
+    compact = folded.replace(" ", "")
+    for raw in aliases:
+        alias = raw.strip()
+        if not alias:
+            continue
+        if f" {alias} " in padded:
+            return True
+        # Compact forms: "qtb", "tanbinh", "q1"
+        ac = alias.replace(" ", "")
+        if len(ac) >= 2 and ac in compact:
+            # Guard ultra-short tokens (e.g. lone "q") — require digit or len>=3
+            if len(ac) >= 3 or any(ch.isdigit() for ch in ac):
+                return True
+    return False
+
+
+def district_keys_in_text(folded: str) -> list[str]:
+    """Canonical district keys found in already-folded text."""
+    found: list[str] = []
+    for entry in DISTRICTS:
+        if alias_hits_text(folded, entry.aliases):
+            found.append(entry.key)
+    return found
+
+
+def district_keys_in_message(message: str) -> list[str]:
+    """Canonical district keys mentioned in the message (e.g. 'tan binh')."""
+    return district_keys_in_text(fold_text(message or ""))
+
+
 def is_area_recommend_intent(message: str) -> bool:
     """User asks which / nearby hotel in a district or area — still in-scope."""
-    return bool(_AREA_RECOMMEND_RE.search(message or ""))
+    text = message or ""
+    if _AREA_RECOMMEND_RE.search(text):
+        return True
+    if district_keys_in_message(text) and _HOTEL_CUE_RE.search(text):
+        return True
+    return False
 
 
 def extract_area_aliases(message: str) -> list[str]:
-    """Return folded district alias strings found in the message."""
-    msg = f" {fold_text(message)} "
+    """Return folded district alias strings for districts found in the message."""
     found: list[str] = []
-    for aliases in _DISTRICT_ALIASES.values():
-        if any(f" {a.strip()} " in msg or a in msg for a in aliases):
-            found.extend(aliases)
+    for key in district_keys_in_message(message):
+        found.extend(district_aliases(key))
     return found
+
+
+def infer_place_district_keys(place: PlaceOut) -> list[str]:
+    """Districts inferred from place address/city only — never from hotel name.
+
+    Name fallback caused false "Tân Bình" membership; empty address → no district.
+    """
+    blob = fold_text(f"{place.address or ''} {place.city or ''}")
+    if not blob.strip():
+        return []
+    return district_keys_in_text(blob)
 
 
 def match_places_in_area(
@@ -99,17 +155,15 @@ def match_places_in_area(
     *,
     limit: int = 5,
 ) -> list[PlaceOut]:
-    """Places whose address/name/city mention a district from the message."""
-    aliases = extract_area_aliases(message)
-    if not aliases or not places:
+    """Places whose address/city map to a district mentioned in the message."""
+    keys = set(district_keys_in_message(message))
+    if not keys or not places:
         return []
 
     out: list[PlaceOut] = []
     for place in places:
-        blob = fold_text(
-            f"{place.name} {place.address or ''} {place.city or ''}"
-        )
-        if any(a.strip() in blob for a in aliases):
+        place_keys = set(infer_place_district_keys(place))
+        if place_keys & keys:
             out.append(place)
         if len(out) >= limit:
             break
@@ -124,12 +178,14 @@ def match_places_in_message(
 ) -> list[PlaceOut]:
     """Return places whose names appear in `message`, strongest first.
 
-    Used so a selected sidebar place (e.g. auto-picked Lancaster) does not
-    override an explicit hotel name in the question (e.g. Park Hyatt).
+    Contiguous multi-token phrases (e.g. \"park hyatt\") outrank lone shared
+    tokens (e.g. Wink … by Hyatt matching only \"hyatt\"). Near-ties at the top
+    stay; weak secondary hits are dropped.
     """
     msg = fold_text(message)
     if not msg or not places:
         return []
+    msg_words = set(msg.split())
 
     scored: list[tuple[int, PlaceOut]] = []
     for place in places:
@@ -137,20 +193,35 @@ def match_places_in_message(
         if len(core) < 4:
             continue
         if core in msg:
-            scored.append((1000 + len(core), place))
+            scored.append((2000 + len(core), place))
             continue
         tokens = [t for t in core.split() if t not in _STOP and len(t) > 2]
         if not tokens:
             continue
-        hits = sum(1 for t in tokens if t in msg.split() or t in msg)
+        hits = sum(1 for t in tokens if t in msg_words)
+        # Contiguous bigrams present in both message and place name.
+        phrase_bonus = 0
+        for i in range(len(tokens) - 1):
+            bigram = f"{tokens[i]} {tokens[i + 1]}"
+            if bigram in msg and bigram in core:
+                phrase_bonus += 500
+        strong_hit = any(len(t) >= 5 and t in msg_words for t in tokens)
         need = 2 if len(tokens) >= 2 else 1
-        if hits >= need:
-            scored.append((hits * 50 + len(core), place))
+        if phrase_bonus:
+            scored.append((phrase_bonus + hits * 50 + len(core), place))
+        elif hits >= need or (strong_hit and hits >= 1):
+            scored.append((hits * 50 + len(core) + (20 if strong_hit else 0), place))
 
+    if not scored:
+        return []
     scored.sort(key=lambda item: item[0], reverse=True)
+    best = scored[0][0]
+    # Keep only near-ties with the best score (same brand branches), drop weak
+    # secondary hits like \"by Hyatt\" when \"Park Hyatt\" already won.
+    cluster = [(s, p) for s, p in scored if s >= best - 80]
     out: list[PlaceOut] = []
     seen: set[str] = set()
-    for _, place in scored:
+    for _, place in cluster:
         key = str(place.id)
         if key in seen:
             continue
@@ -159,3 +230,94 @@ def match_places_in_message(
         if len(out) >= limit:
             break
     return out
+
+
+def brand_candidate_places(
+    message: str,
+    places: list[PlaceOut],
+    *,
+    limit: int = 8,
+) -> list[PlaceOut]:
+    """Places whose *leading* brand matches a distinctive cue from the message.
+
+    Avoids false hits on trailing parent-brand words (\"… by Hyatt\").
+    """
+    msg = fold_text(message)
+    words = [t for t in msg.split() if t not in _STOP and len(t) > 2]
+    if not words or not places:
+        return []
+    # Prefer multi-word brand phrases from the user message.
+    phrases: list[str] = []
+    for i in range(len(words) - 1):
+        phrases.append(f"{words[i]} {words[i + 1]}")
+    phrases.extend([w for w in words if len(w) >= 5])
+
+    out: list[PlaceOut] = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        for place in places:
+            core = place_core_name(place.name)
+            # Phrase / cue must sit at the start of the place brand, not \"by X\".
+            if phrase in core:
+                # Reject mid/tail-only: require match near the beginning.
+                idx = core.find(phrase)
+                if idx < 0 or idx > 12:
+                    continue
+            else:
+                # Unigram: must be among leading content tokens.
+                if " " in phrase:
+                    continue
+                lead = [
+                    t for t in core.split() if t not in _STOP and len(t) > 2
+                ][:2]
+                if phrase not in lead:
+                    continue
+            key = str(place.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(place)
+            if len(out) >= limit:
+                return out
+        # If a multi-word phrase already found ≥1 place, stop (don't widen to
+        # weak unigram \"hyatt\" and pull in unrelated Hyatt soft-brands).
+        if " " in phrase and out:
+            return out
+    return out
+
+
+def shared_brand_token(places: list[PlaceOut], message: str) -> str | None:
+    """Longest *leading* brand token shared by all places and present in message.
+
+    \"Sheraton A\" + \"Sheraton B\" → sheraton. \"Park Hyatt\" + \"Wink by Hyatt\" → None.
+    """
+    if len(places) < 2:
+        return None
+    msg = fold_text(message)
+    msg_tokens = set(msg.split())
+    lead_sets: list[set[str]] = []
+    for place in places:
+        core = place_core_name(place.name)
+        lead = [
+            t for t in core.split() if t not in _STOP and len(t) >= 4
+        ][:2]
+        if not lead:
+            return None
+        lead_sets.append(set(lead))
+    shared = set.intersection(*lead_sets)
+    in_msg = [t for t in shared if t in msg_tokens or t in msg]
+    if not in_msg:
+        return None
+    return max(in_msg, key=len)
+
+
+def is_brand_ambiguous_named(
+    message: str,
+    named: list[PlaceOut],
+    *,
+    wants_compare: bool,
+) -> bool:
+    """True when ≥2 catalog hits look like one brand, not an explicit multi-hotel ask."""
+    if wants_compare or len(named) < 2:
+        return False
+    return shared_brand_token(named, message) is not None

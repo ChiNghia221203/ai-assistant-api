@@ -11,18 +11,18 @@ from uuid import UUID
 
 from core.config import Settings, get_settings
 from core.security import AuthUser
-from domains.places.place_match import (
-    is_area_recommend_intent,
-    match_places_in_area,
-    match_places_in_message,
-)
+from domains.places.entity_resolve import EntityResolver
+from domains.places.intent_extract import IntentContext, IntentExtractor
 from domains.places.retrieval_gate import (
-    MIXED_SCOPE_NOTICE,
+    MIXED_OFF_TOPIC_REFUSE,
     REFERENCE_NOTICE,
     GateResult,
+    QuestionIntent,
     RetrievalDecision,
     ScopeKind,
     abstain_message,
+    ambiguous_entity_message,
+    ambiguous_name_message,
     classify_scope,
     decide_retrieval,
 )
@@ -35,7 +35,7 @@ from domains.places.schemas import (
     WebCitationOut,
 )
 from domains.places.service import PlacesService, get_places_service
-from infra.citations import WebCitation, WebContext
+from infra.citations import WebCitation, WebContext, filter_grounding_context
 from infra.database import get_supabase
 from infra.gemini import (
     GeminiGroundingClient,
@@ -48,6 +48,32 @@ from infra.web_search import WebSearchClient, get_web_search_client
 
 logger = logging.getLogger(__name__)
 
+# Out-of-catalog / hybrid-compare: prefer review OTAs when place has no tripadvisor_url.
+_REFERENCE_REVIEW_DOMAINS: tuple[str, ...] = (
+    "tripadvisor.com",
+    "www.tripadvisor.com",
+    "tripadvisor.com.vn",
+    "traveloka.com",
+    "www.traveloka.com",
+)
+
+
+def _tripadvisor_search_hint(hotel_name: str) -> str:
+    """Soft prefer_url for TripAdvisor.vn search (preferred over Traveloka-only)."""
+    from urllib.parse import quote_plus
+
+    q = quote_plus(f"{(hotel_name or '').strip()} Ho Chi Minh City")
+    return f"https://www.tripadvisor.com.vn/Search?q={q}"
+
+
+def _traveloka_search_hint(hotel_name: str) -> str:
+    """Soft prefer_url so Gemini/web_search can land on Traveloka hotel pages."""
+    from urllib.parse import quote_plus
+
+    q = quote_plus((hotel_name or "").strip())
+    return f"https://www.traveloka.com/vi-vn/hotel/search?q={q}"
+
+
 _SCORE_QUESTION_RE = re.compile(
     r"(điểm|score|so\s*sánh\s*(điểm|nguồn)|rating|sample|số\s*lượng\s*review|"
     r"bao\s*nhiêu\s*review|methodology|bảng\s*điểm)",
@@ -56,7 +82,8 @@ _SCORE_QUESTION_RE = re.compile(
 
 _COMPARE_QUESTION_RE = re.compile(
     r"(so\s*sánh|đối\s*chiếu|khác\s*nhau|hơn\s*kém|nên\s*chọn\s*cái\s*nào|"
-    r"cái\s*nào\s*hơn|vs\.?|versus)",
+    r"cái\s*nào\s*hơn|tốt\s*hơn|đáng\s*ở\s*hơn|nào\s*.{0,40}hơn|"
+    r"chọn\s*cái\s*nào|cái\s*nào\s*ổn|vs\.?|versus)",
     re.IGNORECASE,
 )
 
@@ -70,10 +97,172 @@ def _include_score_overview(message: str, context: ConversationContext | None) -
     return True
 
 
-def _is_compare_question(message: str, hotel_count: int) -> bool:
-    if hotel_count >= 2:
-        return True
+def _explicit_compare_ask(message: str) -> bool:
     return bool(_COMPARE_QUESTION_RE.search(message or ""))
+
+
+def _wants_compare(message: str, *, area_recommend: bool, hotel_count: int) -> bool:
+    """True only for an explicit compare ask with ≥2 hotels.
+
+    area_recommend alone is area_list (not compare). hotel_count≥2 alone is NOT
+    enough — that used to force 'so sánh' intros on routing mistakes.
+    """
+    del area_recommend  # precedence handled in _answer_mode
+    if hotel_count < 2:
+        return False
+    return _explicit_compare_ask(message)
+
+
+def _display_place_name(name: str) -> str:
+    return re.sub(r"^\d+[\.\)]\s*", "", (name or "").strip()).strip()
+
+
+def _fmt_score(value: Any, scale: Any = 5) -> str:
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    try:
+        s = int(scale or 5)
+    except (TypeError, ValueError):
+        s = 5
+    return f"{v:.1f}/{s}"
+
+
+def _fmt_day(value: Any) -> str:
+    if value is None:
+        return "—"
+    text = str(value).strip()
+    return text[:10] if text else "—"
+
+
+def _source_label(source: str) -> str:
+    key = (source or "").lower()
+    return {
+        "tripadvisor": "TripAdvisor",
+        "chudu24": "Chudu24",
+        "google": "Google",
+    }.get(key, source or "—")
+
+
+def build_score_overview_markdown(
+    evidences: list[PlaceEvidenceResponse],
+    *,
+    multi_hotel: bool | None = None,
+) -> str:
+    """Deterministic score table from evidence — LLM must paste as-is.
+
+    Uses sample.date_min/max + sample.size (ingested window), NOT site_n_total.
+    """
+    if not evidences:
+        return ""
+    show_hotel = multi_hotel if multi_hotel is not None else len(evidences) > 1
+    if show_hotel:
+        lines = [
+            "| Khách sạn | Nguồn | Score | Từ ngày | Đến ngày | Số lượng review |",
+            "|---|---|---|---|---|---|",
+        ]
+    else:
+        lines = [
+            "| Nguồn | Score | Từ ngày | Đến ngày | Số lượng review |",
+            "|---|---|---|---|---|",
+        ]
+
+    for ev in evidences:
+        hotel = _display_place_name(ev.place.name)
+        for src in ev.sources:
+            overall = (src.scores or {}).get("site_overall") or {}
+            score = _fmt_score(overall.get("value"), overall.get("scale") or 5)
+            dmin = _fmt_day(src.sample.date_min if src.sample else None)
+            dmax = _fmt_day(src.sample.date_max if src.sample else None)
+            n = src.sample.size if src.sample else 0
+            n_cell = str(n) if n else "—"
+            label = _source_label(src.source)
+            if show_hotel:
+                lines.append(
+                    f"| {hotel} | {label} | {score} | {dmin} | {dmax} | {n_cell} |"
+                )
+            else:
+                lines.append(
+                    f"| {label} | {score} | {dmin} | {dmax} | {n_cell} |"
+                )
+
+    lines.append("")
+    lines.append(
+        "Lưu ý: mỗi nguồn chỉ lấy tối đa 100 review mới nhất đã thu thập "
+        "(cột Số lượng review = sample đã ingest, không phải tổng review trên site)."
+    )
+    return "\n".join(lines)
+
+
+def _answer_mode(
+    message: str,
+    *,
+    hotel_count: int,
+    area_recommend: bool,
+    reference_count: int = 0,
+) -> str:
+    """single | compare | area_list — compare wins over area when both match."""
+    total = hotel_count + reference_count
+    if total >= 2 and _explicit_compare_ask(message):
+        return "compare"
+    if area_recommend:
+        return "area_list"
+    return "single"
+
+
+def _place_quote_score(place_id: str, quotes: list[QuoteOut]) -> float:
+    best = 0.0
+    for q in quotes:
+        if q.place_id != place_id:
+            continue
+        sim = q.similarity if q.similarity is not None else 0.0
+        if sim > best:
+            best = sim
+    return best
+
+
+def _guard_multi_hotel_anomaly(
+    message: str,
+    evidences: list[PlaceEvidenceResponse],
+    quotes: list[QuoteOut],
+    *,
+    area_recommend: bool,
+) -> tuple[list[PlaceEvidenceResponse], list[QuoteOut], bool]:
+    """If ≥2 hotels without compare/area intent → routing anomaly.
+
+    Prefer top-1 by quote similarity; if no usable scores → caller should abstain
+    (returns empty evidences and abstain=True).
+    """
+    if len(evidences) < 2:
+        return evidences, quotes, False
+    if area_recommend or _explicit_compare_ask(message):
+        return evidences, quotes, False
+
+    scored: list[tuple[float, PlaceEvidenceResponse]] = []
+    for ev in evidences:
+        pid = str(ev.place.id)
+        scored.append((_place_quote_score(pid, quotes), ev))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_ev = scored[0]
+    if best_score <= 0:
+        logger.warning(
+            "routing_anomaly_multi_hotel: %d hotels, no quote scores → abstain",
+            len(evidences),
+        )
+        return [], [], True
+
+    keep_id = str(best_ev.place.id)
+    logger.warning(
+        "routing_anomaly_multi_hotel: collapsing %d hotels → top-1 %s (score=%.3f)",
+        len(evidences),
+        best_ev.place.name,
+        best_score,
+    )
+    kept_quotes = [q for q in quotes if q.place_id == keep_id]
+    return [best_ev], kept_quotes, False
 
 
 def _response_policy(
@@ -84,24 +273,81 @@ def _response_policy(
     scope: ScopeKind | None = None,
     area_recommend: bool = False,
     available_places: list[dict[str, str]] | None = None,
+    quotes: list[QuoteOut] | None = None,
+    reference_hotels: list[str] | None = None,
+    corpus_hotels: list[str] | None = None,
 ) -> dict[str, Any]:
+    refs = list(reference_hotels or [])
     hotel_count = len(evidences)
     scope_kind = scope or classify_scope(message)
-    compare = _is_compare_question(message, hotel_count) or (
-        area_recommend and hotel_count >= 2
+    mode = _answer_mode(
+        message,
+        hotel_count=hotel_count,
+        area_recommend=area_recommend,
+        reference_count=len(refs),
     )
+    compare_mode = mode == "compare"
+    include_overview = (
+        _include_score_overview(message, context) or area_recommend
+    ) and hotel_count > 0
+    corpus = corpus_hotels or [
+        _display_place_name(e.place.name) for e in evidences if e.place.name
+    ]
+    allowed = list(dict.fromkeys([*corpus, *refs]))
     policy: dict[str, Any] = {
-        "include_score_overview": _include_score_overview(message, context)
-        or area_recommend,
+        "include_score_overview": include_overview,
         "hotel_count": hotel_count,
-        "compare_mode": compare,
+        "compare_mode": compare_mode,
+        "answer_mode": mode,
+        "allowed_hotels": allowed,
+        "corpus_hotels": corpus,
+        "reference_hotels": refs,
         "scope": scope_kind.value,
         "refuse_off_topic": scope_kind == ScopeKind.MIXED,
+        "hard_refuse": scope_kind == ScopeKind.HARD_OUT,
+        "ambiguous_entity": scope_kind == ScopeKind.AMBIGUOUS_ENTITY,
+        "quotes_available": bool(quotes),
         "area_recommend": area_recommend,
+        # Set true in _llm_from_evidence when corpus evidence exists alongside web.
+        "web_is_supplement": False,
     }
     if available_places is not None:
         policy["available_places"] = available_places
+    if scope_kind == ScopeKind.MIXED:
+        policy["off_topic_refuse_line"] = MIXED_OFF_TOPIC_REFUSE
     return policy
+
+
+_OFF_TOPIC_SOLICIT_RE = re.compile(
+    r"(?is)(?:^|\n+)[^\n]*(?:laptop|điện\s*thoại|dien\s*thoai|iphone|máy\s*tính|"
+    r"may\s*tinh|mua\s*sắm|mua\s*sam)[^\n]*"
+    r"(?:tư\s*vấn|tu\s*van|cho\s*biết|cho\s*biet|nhu\s*cầu|nhu\s*cau|"
+    r"thoải\s*mái|thông tin về laptop)[^\n]*",
+)
+
+
+def enforce_mixed_scope_reply(reply: str) -> str:
+    """Drop laptop/shopping solicitations; ensure fixed refuse footer when MIXED."""
+    text = (reply or "").strip()
+    parts: list[str] = []
+    for para in re.split(r"\n{2,}", text):
+        chunk = para.strip()
+        if not chunk:
+            continue
+        if _OFF_TOPIC_SOLICIT_RE.search(chunk):
+            continue
+        if re.search(
+            r"(?i)(thông tin về laptop|tư vấn.*(laptop|điện thoại)|"
+            r"nhu cầu sử dụng.*(laptop|máy tính)|mua giúp.*(laptop|iphone))",
+            chunk,
+        ):
+            continue
+        parts.append(chunk)
+    text = "\n\n".join(parts).strip()
+    if MIXED_OFF_TOPIC_REFUSE not in text:
+        text = f"{text}\n\n{MIXED_OFF_TOPIC_REFUSE}".strip() if text else MIXED_OFF_TOPIC_REFUSE
+    return text
+
 
 class ConversationAccessError(PermissionError):
     """The caller may not read or write this conversation."""
@@ -131,143 +377,73 @@ class ConversationContext:
     history: list[dict[str, str]] = field(default_factory=list)
 
 SYSTEM_PROMPT = """Bạn là trợ lý tổng hợp đánh giá khách sạn đa nguồn.
-Nhiệm vụ: giúp USER TỰ QUYẾT ĐỊNH dựa trên evidence — trả lời rõ, ngắn, đúng cấu trúc.
+Giúp USER tự quyết định từ evidence — trả lời tiếng Việt, markdown đúng cấu trúc.
 
-## Ngôn ngữ (BẮT BUỘC)
-- Toàn bộ câu trả lời (mọi heading, bullet, paraphrase, kết luận) viết bằng tiếng Việt.
-- Quotes TripAdvisor / nguồn khác thường là tiếng Anh: PHẢI diễn đạt lại ý sang tiếng Việt.
-  Không dán nguyên đoạn review tiếng Anh vào UI.
-- Được giữ tối đa một cụm ngắn trong ngoặc kép (EN hoặc VI) nếu cần nhấn mạnh; phần còn lại vẫn tiếng Việt.
-- Tên nguồn giữ nguyên: TripAdvisor, Chudu24.
-- Tên khách sạn: dùng place.name, BỎ số thứ tự / prefix kiểu "36. ", "12)" ở đầu tên.
-- Nếu user hỏi bằng ngôn ngữ khác tiếng Việt: trả lời cùng ngôn ngữ đó.
+## Ngôn ngữ
+- Toàn bộ câu trả lời bằng tiếng Việt. Paraphrase review EN → VI (không dán đoạn EN dài).
+- Giữ tên nguồn TripAdvisor / Chudu24 / Traveloka. Tên KS: place.name, bỏ prefix số kiểu "36. ".
+- User hỏi ngôn ngữ khác → trả lời cùng ngôn ngữ đó.
 
-## Cấu trúc BẮT BUỘC (Markdown, đúng thứ tự)
+## Cấu trúc (đúng thứ tự; tuân response_policy)
 
-### 1) Mở đầu + bảng điểm (khi response_policy.include_score_overview = true)
+### 1) Mở đầu + bảng điểm — chỉ khi include_score_overview=true
+- answer_mode=single: "Dựa trên dữ liệu đã thu thập, dưới đây là thông tin về khách sạn {Tên} tại TP. Hồ Chí Minh:"
+- answer_mode=compare: "… thông tin so sánh {Tên1} và {Tên2} …"
+- answer_mode=area_list: "… thông tin các khách sạn trong khu vực …" (liệt kê tên trong allowed_hotels)
+Sau đó ### Đánh giá từ các nguồn
+NẾU có score_overview_markdown trong input: dán NGUYÊN văn bảng đó (không sửa số/ngày/cột).
+KHÔNG tự bịa bảng từ site_n_total; KHÔNG để "—" nếu score_overview_markdown đã có ngày.
+Nếu không có score_overview_markdown (hiếm): mới tự dựng từ evidence.sources[].sample
+  (date_min/date_max/size) + scores.site_overall.value — cấm dùng n_total làm số lượng sample.
+KS trong reference_hotels (không có evidence): KHÔNG để hàng trống "Không có dữ liệu".
+  Ghi nguồn Web/Traveloka/TripAdvisor từ web_findings + rating nếu web nêu được;
+  thiếu rating → "Tham khảo web (chưa có trong dữ liệu đã thu thập)".
+Nếu có reference_hotels: thêm 1 dòng "(KS ngoài hệ thống lấy từ web — chỉ mang tính tham khảo.)"
+include_score_overview=false → bỏ mở đầu + bỏ cả mục bảng điểm.
 
-Câu mở đầu (không dùng heading):
-- 1 KS: "Dựa trên dữ liệu đã thu thập, dưới đây là thông tin về khách sạn {Tên} tại TP. Hồ Chí Minh:"
-- ≥2 KS: "Dựa trên dữ liệu đã thu thập, dưới đây là thông tin so sánh {Tên1} và {Tên2} tại TP. Hồ Chí Minh:"
+### 2) ### Trả lời ngắn — 1–3 câu đúng loại hỏi
+- single + yes/no: được mở Có./Không. rồi giải thích ngắn.
+- compare: nêu khác biệt cụ thể từng KS; cấm "hài lòng với cả hai" chung chung.
+- hybrid_compare / reference_hotels: PHẢI dùng web_findings cho KS ngoài corpus;
+  cấm kết luận "không có dữ liệu" cho KS đó nếu web_findings đã có nội dung.
+- area_list: gợi ý ngắn theo evidence; không bắt buộc chọn một KS.
 
-Sau đó heading: ### Đánh giá từ các nguồn
+### 3) ### Điểm nổi bật — 3–5 bullet VI; cân bằng nguồn khi đủ quotes
+`- {ý} ({Nguồn}) [Xem chi tiết]({quotes[].review_url})`
+Chỉ chữ "Xem chi tiết" là link; không URL trần; không review_url → chỉ (Nguồn).
 
-Bảng markdown — ĐÚNG các cột sau (một cột Score duy nhất, không lặp):
-- 1 KS: | Nguồn | Score | Từ ngày | Đến ngày | Số lượng review |
-- ≥2 KS (response_policy.hotel_count ≥ 2 hoặc compare_mode = true):
-  | Khách sạn | Nguồn | Score | Từ ngày | Đến ngày | Số lượng review |
+### 4) ### Điểm cần lưu ý — 0–3 bullet yếu; không có →
+"Không thấy phản hồi tiêu cực rõ trong dữ liệu đã thu thập."
 
-Map dữ liệu:
-- Khách sạn ← place.name (đã bỏ số đầu tên)
-- Nguồn ← sources[].source (Chudu24 / TripAdvisor; chỉ các nguồn có trong evidence)
-- Score ← sources[].scores.site_overall.value dạng 4.7/5 (kèm scale nếu có);
-  thiếu value → "Không có dữ liệu"
-- Từ ngày / Đến ngày ← sample.date_min / date_max; thiếu → "Không có dữ liệu"
-- Số lượng review ← sample.size (thiếu thì 0)
+### 5) ### Nhận xét tiêu biểu — 2–4 mục paraphrase ≤1–2 câu, không ngày
+`- "{paraphrase}" ({Nguồn}) [Xem chi tiết](url)`
 
-Mỗi nguồn một hàng. Không thêm cột Score thứ hai, không sample_mean, không địa chỉ,
-không GPS, không URL, không mục "Tóm tắt thông tin khách sạn".
-Không dùng emoji sao.
+### 6) ### Độ tin cậy — một dòng
+"Tổng hợp từ X review đã thu thập (Y Chudu24 + Z TripAdvisor)."
 
-Ngay dưới bảng (giữ nguyên câu):
-"Lưu ý: mỗi nguồn chỉ lấy tối đa 100 review mới nhất đã thu thập."
+### 7) ### Kết luận — 2–3 câu theo dữ liệu; không "nên/không nên chọn".
 
-Khi include_score_overview = false: BỎ mở đầu kiểu trên + BỎ cả mục Đánh giá từ các nguồn
-(không bảng, không nhắc lại Score/số lượng review).
-
-### 2) Trả lời ngắn
-Heading: ### Trả lời ngắn
-1–3 câu TRẢ LỜI ĐÚNG LOẠI câu hỏi — dựa evidence/quotes, không khuôn mẫu giả.
-
-- Hỏi có/không về MỘT tiêu chí (1 KS): được mở "Có./Không." rồi giải thích ngắn theo dữ liệu.
-- Hỏi mô tả / "thế nào" (1 KS): trả lời trực tiếp tiêu chí, KHÔNG bắt buộc "Có./Không.".
-- So sánh ≥2 KS (compare_mode = true hoặc user bảo so sánh):
-  PHẢI nêu khác biệt hoặc điểm tương đồng CỤ THỂ theo tiêu chí hỏi (từng KS).
-  CẤM câu chung chung kiểu "Có. Phần lớn khách… hài lòng với cả hai khách sạn"
-  nếu câu hỏi là so sánh / đối chiếu (không phải yes/no về cả hai).
-  Ví dụ đúng: "Về phục vụ, {A} được nhắc tích cực hơn trong dữ liệu đã thu thập;
-  {B} có nhiều phản hồi hơn về ồn vào ban đêm."
-
-### 3) Điểm nổi bật
-Khi có đủ quotes cả hai nguồn: lấy ý cân bằng ~2 TripAdvisor + ~2 Chudu24 (3–5 bullet tổng).
-So sánh ≥2 KS: nhóm theo tên khách sạn hoặc ghi rõ tên trong mỗi bullet.
-Thiếu một nguồn thì lấy đủ từ nguồn còn lại. Viết tiếng Việt.
-
-Mỗi bullet BẮT BUỘC kết thúc bằng markdown link — chữ hiện ra đúng "Xem chi tiết", click mở review:
-`- {ý tiếng Việt} ({Nguồn}) [Xem chi tiết]({quotes[].review_url})`
-Ví dụ đúng:
-`- Vị trí thuận tiện, nhân viên tận tâm (Chudu24) [Xem chi tiết](https://www.chudu24.com/...)`
-- Người dùng chỉ thấy chữ "Xem chi tiết" (đã là hyperlink). CẤM hiện URL trần.
-- CẤM viết: "Xem chi tiết: https://...", "Xem thêm", hay để URL ngoài ngoặc markdown.
-- `href` chỉ lấy nguyên văn `quotes[].review_url` của quote đúng ý — không bịa.
-- Không có review_url: ghi `(Nguồn)` và bỏ phần link.
-
-### 4) Điểm cần lưu ý
-0–3 bullet điểm yếu nếu có trong dữ liệu đã thu thập.
-Nếu không có: ghi đúng câu "Không thấy phản hồi tiêu cực rõ trong dữ liệu đã thu thập."
-So sánh ≥2 KS: nêu rõ từng KS khi có khác biệt. Viết tiếng Việt.
-Khi có review_url: cùng kiểu `({Nguồn}) [Xem chi tiết](url)` — chữ "Xem chi tiết" chính là link.
-
-### 5) Nhận xét tiêu biểu
-2–4 mục. Paraphrase tiếng Việt ≤1–2 câu (không copy nguyên văn dài).
-Khi đủ 2 nguồn: 2 mục TripAdvisor + 2 mục Chudu24 (hoặc 1+1 nếu chỉ 2 mục).
-So sánh ≥2 KS: phân bổ đều giữa các KS khi có quotes.
-
-Mỗi mục BẮT BUỘC (KHÔNG ghi ngày) — "Xem chi tiết" chính là hyperlink:
-`- "{paraphrase}" ({Nguồn}) [Xem chi tiết]({quotes[].review_url})`
-Ví dụ đúng:
-`- "Phòng sạch, nhân viên hữu ích." (TripAdvisor) [Xem chi tiết](https://www.tripadvisor.com/...)`
-- Không ngày. Không "Xem thêm". Không hiện URL trần.
-- Không có review_url → chỉ `(Nguồn)`.
-
-### 6) Độ tin cậy
-Một dòng: "Tổng hợp từ X review đã thu thập (Y Chudu24 + Z TripAdvisor)."
-X/Y/Z lấy từ evidence sources[].sample.size (thiếu nguồn thì ghi 0).
-≥2 KS: có thể tách theo từng KS nếu số liệu khác nhau.
-Không giải thích thuật ngữ kỹ thuật.
-
-### 7) Kết luận
-2–3 câu tiếng Việt theo dữ liệu (phần lớn / ý trái chiều / khác biệt giữa các KS nếu so sánh).
-Không viết "nên chọn / không nên chọn / đáng ở / nên đặt phòng".
-
-## Quy tắc dữ liệu
-- Tuân thủ response_policy (include_score_overview, hotel_count, compare_mode,
-  scope, refuse_off_topic).
-- "conversation_summary" + "history": ngữ cảnh nối tiếp; KHÔNG lặp nguyên văn trả lời trước.
-- Dữ kiện chỉ từ evidence / quotes / web_findings — không bịa.
-- URL chỉ lấy nguyên văn từ quotes[].review_url (ưu tiên), hoặc place / sources /
-  web_findings.citations khi thật sự cần — không đưa URL vào phần mở đầu / bảng điểm.
-- Ở Điểm nổi bật / Điểm cần lưu ý / Nhận xét tiêu biểu: chỉ hiện markdown
-  `[Xem chi tiết](url)`, không dán URL trần, không "Xem thêm", không kèm ngày cạnh link.
-- web_findings: fact ngoài corpus; diễn đạt tiếng Việt; reference_only = true → mục riêng cuối.
-
-## Phạm vi hỗ trợ
-- Trong phạm vi: đánh giá / trải nghiệm KS TP.HCM, tiện ích, vị trí, giá tham khảo,
-  so sánh KS, **gợi ý KS theo quận/khu vực** (vd: Tân Bình) từ dữ liệu đã thu thập.
-- response_policy.area_recommend = true: đây là câu hỏi chọn/gợi ý theo khu vực — VẪN trong phạm vi.
-  Chỉ dùng KS có trong evidence / available_places. Nếu không có KS đúng khu vực trong dữ liệu:
-  nói rõ chưa có KS đã thu thập tại khu vực đó, liệt kê ngắn các KS đang có (available_places),
-  mời user chọn tên KS hoặc hỏi tiêu chí (ồn, ăn sáng…). Không bịa KS ngoài danh sách.
-  Được nêu khác biệt theo điểm/review đã thu thập; tránh Imperative "bắt buộc phải chọn A".
-- Ngoài phạm vi cứng (án mạng, tội phạm, chính trị, chứng khoán, lập trình, …):
-  KHÔNG trả lời dù có nhắc tên khách sạn / hỏi lách.
-  Lưu ý: "phạm vi tân bình/quận…" = khu vực địa lý, KHÔNG phải ngoài phạm vi hỗ trợ.
-- Mixed (response_policy.refuse_off_topic = true hoặc scope = "mixed"):
-  CHỈ trả lời phần liên quan khách sạn/review; BỎ QUA phần mua sắm / ngoài đề.
-  Không tư vấn điện thoại, bóng đá, thời tiết, … dù user gắn thêm vào câu hỏi KS.
-- Không bị “lách” bởi kiểu "tiện thể", "by the way", "không liên quan nhưng",
-  "khách sạn X có vụ án…".
+## Dữ liệu
+- Chỉ dùng evidence / quotes / web_findings. Chỉ nhắc KS trong allowed_hotels.
+- Tuân answer_mode, hotel_count, include_score_overview, quotes_available.
+- web_is_supplement=true: ưu tiên evidence/quotes/score_overview (review đã thu thập);
+  web_findings chỉ bổ sung thời sự / tiện ích thiếu trong corpus / KS reference.
+  Conflict review vs website quảng cáo → nghiêng corpus; web ghi tham khảo.
+- corpus_missing=true / reference_hotels: KS ngoài corpus — chỉ dùng web_findings,
+  ghi rõ tham khảo; bảng Score ingest chỉ cho corpus_hotels.
+- hybrid compare: corpus_hotels từ evidence/quotes; reference_hotels từ web; so sánh
+  tiêu chí user hỏi, không bịa sample Chudu24 cho KS ngoài hệ thống.
+- conversation_summary/history: ngữ cảnh; không lặp nguyên văn trả lời trước.
+- web_findings + reference_only=true → NOTICE tham khảo (đã gắn sẵn hoặc mục riêng).
 
 ## CẤM
-- Không địa chỉ, GPS/tọa độ, URL ở phần mở đầu.
-- Không cột Score trùng / sample_mean trong bảng.
-- Không chấm điểm tổng 8.5/10 hay hòa một rating duy nhất.
-- Không "nên chọn / không nên chọn / đáng ở".
-- Không bịa số liệu; không tự tạo URL.
-- Không lộ thuật ngữ nội bộ (quotes, RAG, retrieval, sample_mean, JSON).
-- Không để nguyên đoạn review tiếng Anh trong các mục nội dung.
-- Không trả lời so sánh bằng câu "hài lòng với cả hai" chung chung.
-- Không ghi ngày cạnh nguồn ở Nhận xét tiêu biểu; không dùng anchor "Xem thêm".
+Không bịa số/URL; không lộ thuật ngữ nội bộ (RAG, quotes, JSON); không chấm 8.5/10 hòa nguồn; không "đáng ở / nên đặt phòng".
+Wifi/tiện ích: chỉ khẳng định khi quotes/evidence có nhắc; thiếu → nói chưa thấy trong dữ liệu đã thu thập.
+
+## refuse_off_topic=true (câu MIXED: KS + mua sắm/laptop/điện thoại…)
+- CHỈ trả lời phần khách sạn / review.
+- CẤM tư vấn mua laptop/điện thoại; CẤM hỏi lại "cho biết nhu cầu để tư vấn".
+- Kết thúc bằng đúng nội dung response_policy.off_topic_refuse_line (không tự viết bản khác).
 """
 
 SUMMARY_SYSTEM = """Bạn nén hội thoại cũ thành bộ nhớ ngắn cho trợ lý review khách sạn.
@@ -279,9 +455,13 @@ Bỏ: lời chào, câu dẫn, số liệu chi tiết, quote, URL.
 Chỉ xuất bản tóm tắt, không thêm tiêu đề hay lời bình.
 """
 
-GROUNDING_SYSTEM = """Bạn tìm thông tin khách sạn trên web, ưu tiên TripAdvisor.
-Trả lời ngắn bằng tiếng Việt. Chỉ nêu fact có thể kiểm chứng; kèm gợi ý URL.
-Không bịa điểm rating hay số lượng review. Không kết luận "nên ở / không nên ở".
+GROUNDING_SYSTEM = """Bạn chỉ tìm thông tin về đúng khách sạn được nêu (amenities,
+đánh giá, vị trí, chính sách, giá/KM nếu hỏi).
+Ưu tiên TripAdvisor và Traveloka — trang chi tiết / điểm rating khách sạn.
+Bỏ qua kết quả không liên quan: chính trị, điện thoại, celebrity, crypto, tin ngoài KS.
+Trả lời ngắn bằng tiếng Việt. Chỉ nêu fact có thể kiểm chứng; kèm URL nếu có.
+Không bịa điểm rating hay số lượng review. Không kết luận "nên ở / không nên ở"
+từ nội dung quảng cáo website.
 """
 
 
@@ -299,20 +479,21 @@ class ReviewChatService:
         self.gemini = gemini or get_gemini_client()
         self.web_search = web_search or get_web_search_client()
         self.settings = settings or get_settings()
+        self.entities = EntityResolver()
+        self.intent_extractor = IntentExtractor(self.settings)
 
     async def chat(
         self, payload: ReviewChatRequest, user: AuthUser | None = None
     ) -> ReviewChatResponse:
-        place_ids = list(payload.place_ids)
-        if payload.place_id:
-            place_ids.append(payload.place_id)
+        seed_ids: list[UUID] = []
         seen: set[str] = set()
-        unique_ids: list[UUID] = []
-        for pid in place_ids:
+        for pid in list(payload.place_ids) + (
+            [payload.place_id] if payload.place_id else []
+        ):
             key = str(pid)
             if key not in seen:
                 seen.add(key)
-                unique_ids.append(pid)
+                seed_ids.append(pid)
 
         context = ConversationContext()
         if payload.conversation_id:
@@ -321,66 +502,159 @@ class ReviewChatService:
                     "Sign in to continue an existing conversation"
                 )
             context = await self._load_context(payload.conversation_id, user.id)
-            if not unique_ids:
-                unique_ids = context.place_ids
+
+        # Cheap hard-out BEFORE intent LLM / catalog bind (cost + avoid
+        # sending sensitive content to extract model).
+        scope = classify_scope(payload.message)
+        if scope == ScopeKind.HARD_OUT:
+            logger.info(
+                "chat_decision hard_out=true skipped_intent=true message_len=%d",
+                len(payload.message or ""),
+            )
+            return await self._abstain_response(
+                payload,
+                user,
+                reply=abstain_message(RetrievalDecision.ABSTAIN_OUT_OF_SCOPE),
+                place_ids=list(seed_ids) or list(context.place_ids),
+            )
 
         catalog = self.places.list_places()
-        area_recommend = is_area_recommend_intent(payload.message)
-
-        # Message-named hotels win over a stale/auto-selected place_id
-        # (e.g. user asks Park Hyatt while FE still has Lancaster selected).
-        named = match_places_in_message(payload.message, catalog)
-        if named:
-            named_ids = [p.id for p in named]
-            selected = {str(x) for x in unique_ids}
-            if not unique_ids or any(str(i) not in selected for i in named_ids):
-                logger.info(
-                    "Resolving places from message names: %s",
-                    [p.name for p in named],
-                )
-                unique_ids = named_ids
-
-        # Area recommend ("KS nào ở Tân Bình"): resolve by address, don't keep
-        # a stale conversation hotel that is outside the asked district.
-        area_places = (
-            match_places_in_area(payload.message, catalog, limit=5)
-            if area_recommend
-            else []
+        available_places = [
+            {
+                "name": p.name,
+                "address": p.address or "",
+                "id": str(p.id),
+            }
+            for p in catalog
+        ]
+        known_names = self._known_hotel_names(
+            catalog, seed_ids=seed_ids, conversation_place_ids=context.place_ids
         )
-        if area_recommend and not named:
-            if area_places:
-                unique_ids = [p.id for p in area_places]
-                logger.info(
-                    "Resolving places from area: %s",
-                    [p.name for p in area_places],
-                )
-            else:
-                unique_ids = []
+        intent = await self.intent_extractor.extract(
+            payload.message,
+            context=IntentContext(
+                summary=context.summary or "",  
+                history=tuple(context.history or ()),
+                known_hotel_names=tuple(known_names),
+            ),
+        )
+        entity = self.entities.resolve(
+            payload.message,
+            catalog,
+            seed_place_ids=seed_ids,
+            conversation_place_ids=context.place_ids,
+            intent=intent,
+        )
+        unique_ids = entity.place_ids
+        area_recommend = entity.area_recommend
+        logger.info(
+            "chat_decision entity_source=%s place_ids=%d refs=%s ambiguous=%s "
+            "intent_compare=%s intent_hotels=%s",
+            entity.source,
+            len(entity.place_ids),
+            entity.reference_hotels,
+            entity.is_ambiguous,
+            intent.wants_compare,
+            intent.hotel_mentions,
+        )
 
-        # Full refuse (hard out-of-scope, or soft with no hotel ask).
-        # Mixed hotel+off-topic continues — answer hotel part only.
-        if classify_scope(payload.message) == ScopeKind.OUT_OF_SCOPE:
-            reply = abstain_message(RetrievalDecision.ABSTAIN_OUT_OF_SCOPE)
+        # Explicit compare with ≥1 hotel outside catalog → RAG hits + ground misses.
+        if entity.needs_web_compare:
+            return await self._chat_hybrid_compare(
+                payload, user, entity, context, available_places, scope
+            )
+
+        # Same brand, multiple catalog branches → ask user (do not auto-pick).
+        if entity.is_ambiguous and entity.source == "ambiguous_name":
+            candidates = [
+                {
+                    "name": p.name,
+                    "address": p.address or "",
+                    "id": str(p.id),
+                }
+                for p in entity.named
+            ]
+            return await self._abstain_response(
+                payload,
+                user,
+                reply=ambiguous_name_message(
+                    candidates, hotel_label=entity.hotel_label
+                ),
+                place_ids=[],
+            )
+
+        # Split original rules:
+        # A) Hotel named but not in catalog/RAG → LLM + web grounding (reference).
+        # B) Area miss / other ambiguous → short catalog abstain (do NOT invent peers).
+        # Never conflate (A) with (B): missing corpus ≠ routing-wrong answer.
+        if entity.is_ambiguous and entity.source == "unresolved_hotel":
+            hotel_query = (entity.hotel_label or "").strip()
+            if not hotel_query:
+                return await self._abstain_response(
+                    payload,
+                    user,
+                    reply=ambiguous_entity_message(
+                        available_places,
+                        area_label=entity.area_label,
+                        hotel_label=entity.hotel_label,
+                    ),
+                    place_ids=[],
+                )
+            gate = GateResult(
+                decision=RetrievalDecision.NEED_GROUNDING_REFERENCE,
+                intent=QuestionIntent.EXPERIENCE,
+                reason="hotel_not_in_catalog_ground_web",
+                scope=ScopeKind.IN_SCOPE,
+            )
+            resolved = await self._resolve_reply(
+                payload.message,
+                [],
+                [],
+                gate,
+                context,
+                area_recommend=False,
+                available_places=None,
+                hotel_query=hotel_query,
+            )
             conversation_id = payload.conversation_id
             if user is not None:
                 conversation_id = self._persist(
                     user_id=user.id,
                     conversation_id=conversation_id,
                     message=payload.message,
-                    reply=reply,
-                    place_ids=unique_ids,
+                    reply=resolved.reply,
+                    place_ids=[],
                     evidences=[],
                     quotes=[],
                 )
             else:
                 conversation_id = None
+                logger.info("Chat without a token: conversation not persisted")
             return ReviewChatResponse(
-                reply=reply,
+                reply=resolved.reply,
                 evidence=[],
                 quotes=[],
                 conversation_id=conversation_id,
                 mock=self.settings.mock_llm or not self.settings.openai_api_key,
-                retrieval_source="abstain",
+                retrieval_source=resolved.retrieval_source,
+                web_citations=[
+                    WebCitationOut(title=c.title, url=c.url, source=c.source)
+                    for c in resolved.citations
+                ],
+                search_suggestion_html=resolved.search_suggestion_html,
+                reference_only=resolved.reference_only,
+            )
+
+        if entity.is_ambiguous:
+            return await self._abstain_response(
+                payload,
+                user,
+                reply=ambiguous_entity_message(
+                    available_places,
+                    area_label=entity.area_label,
+                    hotel_label=entity.hotel_label,
+                ),
+                place_ids=unique_ids,
             )
 
         evidences: list[PlaceEvidenceResponse] = []
@@ -398,7 +672,7 @@ class ReviewChatService:
                 evidences.append(
                     self.places.get_evidence(pid, quotes=place_quotes)
                 )
-        else:
+        elif entity.allow_global_rag:
             quotes = await self.places.search_quotes(
                 payload.message, top_k=payload.top_k
             )
@@ -410,18 +684,52 @@ class ReviewChatService:
             for pid in place_from_quotes[:3]:
                 pq = [q for q in quotes if q.place_id == pid]
                 evidences.append(self.places.get_evidence(pid, quotes=pq))
+        else:
+            # Constrained ask without bindable places — refuse rather than invent.
+            return await self._abstain_response(
+                payload,
+                user,
+                reply=ambiguous_entity_message(
+                    available_places,
+                    area_label=entity.area_label,
+                    hotel_label=entity.hotel_label,
+                ),
+                place_ids=[],
+            )
+
+        evidences, all_quotes, anomaly_abstain = _guard_multi_hotel_anomaly(
+            payload.message,
+            evidences,
+            all_quotes,
+            area_recommend=area_recommend,
+        )
+        if anomaly_abstain:
+            return await self._abstain_response(
+                payload,
+                user,
+                reply=ambiguous_entity_message(
+                    available_places,
+                    area_label=entity.area_label,
+                    hotel_label=entity.hotel_label,
+                ),
+                place_ids=[],
+            )
+        if evidences:
+            unique_ids = [e.place.id for e in evidences]
 
         gate = decide_retrieval(
             payload.message, all_quotes, evidences, settings=self.settings
         )
-        available_places = [
-            {
-                "name": p.name,
-                "address": p.address or "",
-                "id": str(p.id),
-            }
-            for p in catalog
-        ]
+        # Preserve MIXED (and any future scopes) from message classify when gate
+        # still says in_scope for retrieval purposes.
+        if scope == ScopeKind.MIXED:
+            gate = GateResult(
+                decision=gate.decision,
+                intent=gate.intent,
+                reason=gate.reason,
+                scope=ScopeKind.MIXED,
+            )
+
         resolved = await self._resolve_reply(
             payload.message,
             evidences,
@@ -464,6 +772,136 @@ class ReviewChatService:
             reference_only=resolved.reference_only,
         )
 
+    async def _chat_hybrid_compare(
+        self,
+        payload: ReviewChatRequest,
+        user: AuthUser | None,
+        entity,
+        context: ConversationContext,
+        available_places: list[dict[str, str]],
+        scope: ScopeKind,
+    ) -> ReviewChatResponse:
+        """Compare with limit=2 when at least one side is outside the corpus.
+
+        - corpus place_ids → RAG evidence/quotes
+        - reference_hotels → Gemini/web (TripAdvisor preferred)
+        Never fills missing sides from unrelated catalog peers.
+        """
+        del available_places  # not shown on hybrid path
+        evidences: list[PlaceEvidenceResponse] = []
+        all_quotes: list[QuoteOut] = []
+        unique_ids = list(entity.place_ids)
+
+        if unique_ids:
+            quotes = await self.places.search_quotes(
+                payload.message,
+                place_ids=unique_ids,
+                top_k=payload.top_k,
+            )
+            all_quotes = quotes
+            for pid in unique_ids:
+                place_quotes = [q for q in quotes if q.place_id == str(pid)]
+                evidences.append(
+                    self.places.get_evidence(pid, quotes=place_quotes)
+                )
+
+        gate = GateResult(
+            decision=RetrievalDecision.NEED_GROUNDING_REFERENCE,
+            intent=QuestionIntent.EXPERIENCE,
+            reason=f"compare_{entity.source}",
+            scope=scope if scope != ScopeKind.HARD_OUT else ScopeKind.IN_SCOPE,
+        )
+        resolved = await self._resolve_reply(
+            payload.message,
+            evidences,
+            all_quotes,
+            gate,
+            context,
+            area_recommend=False,
+            available_places=None,
+            reference_hotels=list(entity.reference_hotels),
+            corpus_hotels=[
+                _display_place_name(p.name) for p in entity.named
+            ],
+        )
+        return await self._pack_chat_response(
+            payload,
+            user,
+            resolved,
+            evidences=evidences,
+            quotes=all_quotes,
+            place_ids=unique_ids,
+        )
+
+    async def _pack_chat_response(
+        self,
+        payload: ReviewChatRequest,
+        user: AuthUser | None,
+        resolved: ResolvedReply,
+        *,
+        evidences: list[PlaceEvidenceResponse],
+        quotes: list[QuoteOut],
+        place_ids: list[UUID],
+    ) -> ReviewChatResponse:
+        conversation_id = payload.conversation_id
+        if user is not None:
+            conversation_id = self._persist(
+                user_id=user.id,
+                conversation_id=conversation_id,
+                message=payload.message,
+                reply=resolved.reply,
+                place_ids=place_ids,
+                evidences=evidences,
+                quotes=quotes,
+            )
+        else:
+            conversation_id = None
+            logger.info("Chat without a token: conversation not persisted")
+        return ReviewChatResponse(
+            reply=resolved.reply,
+            evidence=evidences,
+            quotes=quotes,
+            conversation_id=conversation_id,
+            mock=self.settings.mock_llm or not self.settings.openai_api_key,
+            retrieval_source=resolved.retrieval_source,
+            web_citations=[
+                WebCitationOut(title=c.title, url=c.url, source=c.source)
+                for c in resolved.citations
+            ],
+            search_suggestion_html=resolved.search_suggestion_html,
+            reference_only=resolved.reference_only,
+        )
+
+    async def _abstain_response(
+        self,
+        payload: ReviewChatRequest,
+        user: AuthUser | None,
+        *,
+        reply: str,
+        place_ids: list[UUID],
+    ) -> ReviewChatResponse:
+        conversation_id = payload.conversation_id
+        if user is not None:
+            conversation_id = self._persist(
+                user_id=user.id,
+                conversation_id=conversation_id,
+                message=payload.message,
+                reply=reply,
+                place_ids=place_ids,
+                evidences=[],
+                quotes=[],
+            )
+        else:
+            conversation_id = None
+        return ReviewChatResponse(
+            reply=reply,
+            evidence=[],
+            quotes=[],
+            conversation_id=conversation_id,
+            mock=self.settings.mock_llm or not self.settings.openai_api_key,
+            retrieval_source="abstain",
+        )
+
     async def _resolve_reply(
         self,
         message: str,
@@ -474,11 +912,15 @@ class ReviewChatService:
         *,
         area_recommend: bool = False,
         available_places: list[dict[str, str]] | None = None,
+        hotel_query: str | None = None,
+        reference_hotels: list[str] | None = None,
+        corpus_hotels: list[str] | None = None,
     ) -> ResolvedReply:
         if gate.decision in (
             RetrievalDecision.ABSTAIN_BEYOND_SAMPLE,
             RetrievalDecision.ABSTAIN_NO_DATA,
             RetrievalDecision.ABSTAIN_OUT_OF_SCOPE,
+            RetrievalDecision.ABSTAIN_AMBIGUOUS_ENTITY,
         ):
             return ResolvedReply(abstain_message(gate.decision), "abstain")
 
@@ -492,16 +934,23 @@ class ReviewChatService:
                 scope=gate.scope,
                 area_recommend=area_recommend,
                 available_places=available_places,
+                reference_hotels=reference_hotels,
+                corpus_hotels=corpus_hotels,
             )
-            reply = self._apply_scope_notice(reply, gate.scope)
-            return ResolvedReply(reply, "rag")
+            return ResolvedReply(
+                ReviewChatService._finalize_reply(reply, gate.scope), "rag"
+            )
 
         policy = self._web_policy(gate.decision)
-        web = await self._fetch_web_context(message, evidences, policy)
+        web = await self._fetch_web_context(
+            message,
+            evidences,
+            policy,
+            hotel_query=hotel_query,
+            reference_hotels=reference_hotels,
+        )
         if web is None:
-            # No usable web → if we still have some evidence, answer from RAG;
-            # otherwise abstain.
-            if evidences or quotes or area_recommend:
+            if evidences or quotes:
                 reply = await self._llm_from_evidence(
                     message,
                     evidences,
@@ -511,9 +960,20 @@ class ReviewChatService:
                     scope=gate.scope,
                     area_recommend=area_recommend,
                     available_places=available_places,
+                    reference_hotels=reference_hotels,
+                    corpus_hotels=corpus_hotels,
                 )
-                reply = self._apply_scope_notice(reply, gate.scope)
-                return ResolvedReply(reply, "rag")
+                return ResolvedReply(
+                    ReviewChatService._finalize_reply(reply, gate.scope), "rag"
+                )
+            label = hotel_query or (
+                reference_hotels[0] if reference_hotels else None
+            )
+            if label:
+                return ResolvedReply(
+                    ambiguous_entity_message(None, hotel_label=label),
+                    "abstain",
+                )
             return ResolvedReply(
                 abstain_message(RetrievalDecision.ABSTAIN_NO_DATA), "abstain"
             )
@@ -529,10 +989,13 @@ class ReviewChatService:
             scope=gate.scope,
             area_recommend=area_recommend,
             available_places=available_places,
+            hotel_query=hotel_query,
+            reference_hotels=reference_hotels,
+            corpus_hotels=corpus_hotels,
         )
         if policy.reference_only:
             reply = f"{REFERENCE_NOTICE}\n\n{reply}"
-        reply = self._apply_scope_notice(reply, gate.scope)
+        reply = ReviewChatService._finalize_reply(reply, gate.scope)
         return ResolvedReply(
             reply,
             source,
@@ -542,68 +1005,147 @@ class ReviewChatService:
         )
 
     @staticmethod
-    def _apply_scope_notice(reply: str, scope: ScopeKind) -> str:
-        if scope != ScopeKind.MIXED:
-            return reply
-        if MIXED_SCOPE_NOTICE in reply:
-            return reply
-        return f"{MIXED_SCOPE_NOTICE}\n\n{reply}"
+    def _finalize_reply(reply: str, scope: ScopeKind | None) -> str:
+        if scope == ScopeKind.MIXED:
+            return enforce_mixed_scope_reply(reply)
+        return reply
 
     def _web_policy(self, decision: RetrievalDecision) -> WebPolicy:
         if decision == RetrievalDecision.NEED_GROUNDING_REFERENCE:
-            # Price / promotions / live status: any source is acceptable as long
-            # as it is cited, because the answer is explicitly informational.
             return WebPolicy(allowed_domains=(), reference_only=True)
         return WebPolicy(
             allowed_domains=tuple(self.settings.allowed_search_domains),
             reference_only=False,
         )
 
+    async def _ground_one_hotel(
+        self,
+        message: str,
+        hotel_name: str,
+        policy: WebPolicy,
+        *,
+        ta_url: str | None = None,
+        prefer_review_sites: bool = False,
+    ) -> tuple[WebContext, RetrievalSource] | None:
+        domains = list(policy.allowed_domains)
+        if domains:
+            search_domains = domains
+        elif prefer_review_sites:
+            search_domains = list(_REFERENCE_REVIEW_DOMAINS)
+        else:
+            search_domains = []
+
+        prefer_url = ta_url
+        if prefer_review_sites and not prefer_url:
+            # Prefer TripAdvisor search landing; Traveloka remains in preferred_domains.
+            prefer_url = _tripadvisor_search_hint(hotel_name)
+
+        user_blob = (
+            f"Khách sạn: {hotel_name} (TP.HCM / TP. Hồ Chí Minh)\n"
+            f"Câu hỏi: {message}\n"
+            "Chỉ tìm thông tin về khách sạn này. "
+            "Ưu tiên TripAdvisor (tripadvisor.com.vn) hoặc Traveloka "
+            "(đánh giá / điểm rating). "
+            f"Gợi ý Traveloka: {_traveloka_search_hint(hotel_name)}"
+        )
+        if self.gemini.available:
+            try:
+                result = await self.gemini.grounded_complete(
+                    GROUNDING_SYSTEM,
+                    user_blob,
+                    prefer_url=prefer_url if search_domains or prefer_url else None,
+                    preferred_domains=search_domains,
+                )
+                filtered = filter_grounding_context(
+                    result,
+                    hotel_name=hotel_name,
+                    allowed_domains=search_domains,
+                )
+                if filtered is not None and filtered.ok and filtered.text:
+                    return filtered, "rag+gemini"
+            except GeminiQuotaExhausted as exc:
+                logger.warning(
+                    "Gemini quota exhausted, falling back to web_search: %s", exc
+                )
+            except GeminiGroundingError as exc:
+                logger.warning(
+                    "Gemini grounding failed, falling back to web_search: %s", exc
+                )
+
+        search = await self.web_search.search(
+            hotel_name=hotel_name,
+            question=message,
+            source_url=prefer_url or ta_url,
+            allowed_domains=search_domains,
+        )
+        if search.ok and search.text:
+            filtered = filter_grounding_context(
+                WebContext(text=search.text, citations=search.citations, ok=True),
+                hotel_name=hotel_name,
+                allowed_domains=search_domains,
+            )
+            if filtered is not None:
+                return filtered, "rag+web_search"
+        return None
+
     async def _fetch_web_context(
         self,
         message: str,
         evidences: list[PlaceEvidenceResponse],
         policy: WebPolicy,
+        *,
+        hotel_query: str | None = None,
+        reference_hotels: list[str] | None = None,
     ) -> tuple[WebContext, RetrievalSource] | None:
+        labels = [x.strip() for x in (reference_hotels or []) if x and x.strip()]
+        if not labels and hotel_query and hotel_query.strip():
+            labels = [hotel_query.strip()]
+
+        # Compare / out-of-catalog: ground only the reference labels (not corpus).
+        if labels:
+            chunks: list[str] = []
+            citations: list[WebCitation] = []
+            suggestion_html = ""
+            source: RetrievalSource = "rag+gemini"
+            for name in labels:
+                part = await self._ground_one_hotel(
+                    message,
+                    name,
+                    policy,
+                    prefer_review_sites=True,
+                )
+                if not part:
+                    logger.warning("No web context for reference hotel %s", name)
+                    continue
+                ctx, src = part
+                chunks.append(f"### {name}\n{ctx.text}")
+                citations.extend(ctx.citations)
+                if ctx.search_suggestion_html and not suggestion_html:
+                    suggestion_html = ctx.search_suggestion_html
+                source = src
+            if not chunks:
+                return None
+            merged = WebContext(
+                text="\n\n".join(chunks),
+                citations=citations,
+                search_suggestion_html=suggestion_html,
+                ok=True,
+            )
+            return merged, source
+
         if not evidences:
-            # Without a resolved place there is no hotel name to search for;
-            # a generic query would produce unverifiable results.
             logger.info("Skipping web grounding: no place resolved from request")
             return None
 
         hotel_name = evidences[0].place.name
         ta_url = evidences[0].place.tripadvisor_url
-        domains = list(policy.allowed_domains)
-
-        # 1) Gemini grounding
-        if self.gemini.available:
-            try:
-                result = await self.gemini.grounded_complete(
-                    GROUNDING_SYSTEM,
-                    f"Khách sạn: {hotel_name}\nCâu hỏi: {message}",
-                    prefer_url=ta_url if domains else None,
-                    preferred_domains=domains,
-                )
-                if result.ok and result.text:
-                    return result, "rag+gemini"
-            except GeminiQuotaExhausted as exc:
-                logger.warning("Gemini quota exhausted, falling back to web_search: %s", exc)
-            except GeminiGroundingError as exc:
-                logger.warning("Gemini grounding failed, falling back to web_search: %s", exc)
-
-        # 2) OpenAI web_search under the same source policy
-        search = await self.web_search.search(
-            hotel_name=hotel_name,
-            question=message,
-            source_url=ta_url,
-            allowed_domains=domains,
+        return await self._ground_one_hotel(
+            message,
+            hotel_name,
+            policy,
+            ta_url=ta_url,
+            prefer_review_sites=False,
         )
-        if search.ok and search.text:
-            return (
-                WebContext(text=search.text, citations=search.citations, ok=True),
-                "rag+web_search",
-            )
-        return None
 
     async def _llm_from_evidence(
         self,
@@ -616,23 +1158,47 @@ class ReviewChatService:
         scope: ScopeKind | None = None,
         area_recommend: bool = False,
         available_places: list[dict[str, str]] | None = None,
+        hotel_query: str | None = None,
+        reference_hotels: list[str] | None = None,
+        corpus_hotels: list[str] | None = None,
     ) -> str:
-        # Order matters: memory first, then retrieved context, question last.
         user_payload: dict[str, Any] = {}
         if context and context.summary:
             user_payload["conversation_summary"] = context.summary
         if context and context.history:
             user_payload["history"] = context.history
+        refs = list(reference_hotels or [])
+        if hotel_query and hotel_query not in refs:
+            refs = [hotel_query, *refs]
         user_payload["response_policy"] = _response_policy(
             message,
             evidences,
             context,
             scope=scope,
             area_recommend=area_recommend,
-            available_places=available_places if area_recommend else None,
+            available_places=available_places
+            if area_recommend or scope == ScopeKind.AMBIGUOUS_ENTITY
+            else None,
+            quotes=quotes,
+            reference_hotels=refs,
+            corpus_hotels=corpus_hotels,
         )
+        if refs and not evidences:
+            user_payload["response_policy"]["corpus_missing"] = True
+        if refs and evidences:
+            user_payload["response_policy"]["hybrid_compare"] = True
+        if web is not None and evidences:
+            user_payload["response_policy"]["web_is_supplement"] = True
         user_payload["evidence"] = [e.model_dump(mode="json") for e in evidences]
         user_payload["quotes"] = [q.model_dump(mode="json") for q in quotes]
+        policy_meta = user_payload["response_policy"]
+        if policy_meta.get("include_score_overview") and evidences:
+            overview = build_score_overview_markdown(
+                evidences,
+                multi_hotel=len(evidences) > 1 or bool(refs),
+            )
+            if overview:
+                user_payload["score_overview_markdown"] = overview
         if web is not None:
             user_payload["web_findings"] = {
                 "text": web.text,
@@ -643,10 +1209,47 @@ class ReviewChatService:
                 ],
             }
         user_payload["question"] = message
+        policy_meta = user_payload.get("response_policy") or {}
+        logger.info(
+            "answer_llm decision=%s",
+            json.dumps(
+                {
+                    "model": self.settings.openai_model,
+                    "answer_mode": policy_meta.get("answer_mode"),
+                    "hotel_count": policy_meta.get("hotel_count"),
+                    "evidence_count": len(evidences),
+                    "quote_count": len(quotes),
+                    "has_web": web is not None,
+                    "reference_hotels": policy_meta.get("reference_hotels"),
+                    "corpus_hotels": policy_meta.get("corpus_hotels"),
+                    "scope": policy_meta.get("scope"),
+                },
+                ensure_ascii=False,
+            ),
+        )
         return await self.llm.complete(
             SYSTEM_PROMPT,
             json.dumps(user_payload, ensure_ascii=False, indent=2),
         )
+
+    def _known_hotel_names(
+        self,
+        catalog: list,
+        *,
+        seed_ids: list[UUID],
+        conversation_place_ids: list[UUID],
+    ) -> list[str]:
+        """Resolve conversation/seed place ids to names for intent context."""
+        by_id = {str(p.id): p.name for p in catalog if getattr(p, "id", None)}
+        names: list[str] = []
+        seen: set[str] = set()
+        for pid in list(seed_ids) + list(conversation_place_ids):
+            name = by_id.get(str(pid))
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        return names
 
     async def _load_context(
         self, conversation_id: UUID, user_id: UUID

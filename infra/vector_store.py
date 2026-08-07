@@ -80,6 +80,7 @@ class PgVectorStore:
         query: str,
         top_k: int = 8,
         place_id: str | UUID | None = None,
+        source: str | None = None,
     ) -> list[DocumentChunk]:
         query_embedding = await self.embedder.embed_one(query)
         sb = get_supabase()
@@ -89,6 +90,8 @@ class PgVectorStore:
         }
         if place_id:
             params["filter_place_id"] = str(place_id)
+        if source:
+            params["filter_source"] = source
 
         result = sb.rpc("match_documents", params).execute()
         rows = result.data or []
