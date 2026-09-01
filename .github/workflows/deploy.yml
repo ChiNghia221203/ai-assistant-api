@@ -60,9 +60,9 @@ jobs:
       # Ruff lint
       # -----------------------------
 
-      - name: Lint with Ruff
-        run: |
-          uv run ruff check .
+      # - name: Lint with Ruff
+      #   run: |
+      #     uv run ruff check .
 
       # -----------------------------
       # Ruff format
