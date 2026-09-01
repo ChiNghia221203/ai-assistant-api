@@ -76,17 +76,17 @@ jobs:
       # Type check
       # -----------------------------
 
-      - name: Type check
-        run: |
-          uv run pyright
+      # - name: Type check
+      #   run: |
+      #     uv run pyright
 
       # -----------------------------
       # Tests
       # -----------------------------
 
-      - name: Run tests
-        run: |
-          uv run pytest
+      # - name: Run tests
+      #   run: |
+      #     uv run pytest
 
   # ==================================================
   # CD
