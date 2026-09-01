@@ -1,9 +1,10 @@
-name: FastAPI CI/CD Pipeline
+run-name: FastAPI CI/CD Pipeline
 
 on:
   push:
     branches:
       - main
+
   pull_request:
     branches:
       - main
@@ -12,49 +13,102 @@ permissions:
   contents: read
 
 jobs:
+  # ==================================================
+  # CI
+  # ==================================================
+
   test:
     name: CI - Test Application
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 10
+
     steps:
-      # Lấy source code
+      # -----------------------------
+      # Checkout
+      # -----------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Setup Python + cache pip tích hợp sẵn
+      # -----------------------------
+      # Setup Python
+      # -----------------------------
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      # Cài dependencies
+      # -----------------------------
+      # Install uv
+      # -----------------------------
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      # -----------------------------
+      # Install dependencies
+      # -----------------------------
+
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          uv sync --locked
 
-      # Kiểm tra format/code quality (nên pin version ruff trong requirements-dev.txt)
+      # -----------------------------
+      # Ruff lint
+      # -----------------------------
+
       - name: Lint with Ruff
         run: |
-          ruff check .
+          uv run ruff check .
 
-      # Chạy test
+      # -----------------------------
+      # Ruff format
+      # -----------------------------
+
+      - name: Check formatting
+        run: |
+          uv run ruff format --check .
+
+      # -----------------------------
+      # Type check
+      # -----------------------------
+
+      - name: Type check
+        run: |
+          uv run pyright
+
+      # -----------------------------
+      # Tests
+      # -----------------------------
+
       - name: Run tests
         run: |
-          pytest
+          uv run pytest
+
+  # ==================================================
+  # CD
+  # ==================================================
 
   deploy:
     name: CD - Deploy Render
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 5
-    # Chỉ chạy khi CI thành công
+
     needs:
       - test
-    # Chỉ deploy khi push main (không chạy khi PR)
+
+    # Chỉ deploy khi push trực tiếp vào main
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
     concurrency:
       group: deploy-production
       cancel-in-progress: false
+
     steps:
       - name: Trigger Render deployment
         run: |
